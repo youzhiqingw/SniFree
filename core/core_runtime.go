@@ -16,9 +16,11 @@ import (
 	"github.com/miekg/dns"
 
 	"snishaper/common"
-	"snishaper/pkg/certmanager"
-	"snishaper/pkg/singtun"
-	"snishaper/proxy"
+	"github.com/SnishaperTeam/snishaper-core/certmanager"
+	"github.com/SnishaperTeam/snishaper-core/netiface"
+	"github.com/SnishaperTeam/snishaper-core/singtun"
+	corelog "github.com/SnishaperTeam/snishaper-core/log"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 // logBufPool provides reusable byte buffers for log formatting
@@ -43,11 +45,15 @@ type coreRuntime struct {
 	logCaptureMu      sync.RWMutex
 	logCaptureEnabled bool
 	proxyOpMu         sync.Mutex
+	tunOpMu           sync.Mutex
 	tunStateMu        sync.RWMutex
 	tunStarting       bool
 	tunStartErr       string
 	routeEventsMu     sync.Mutex
 	routeEvents       []RouteEvent
+	rulesWatchStop    func()
+	// ifaces 网卡选择器实例；原包级缓存已随库化改为实例持有。
+	ifaces *netiface.Selector
 }
 
 func newCoreRuntime() (*coreRuntime, error) {
@@ -56,10 +62,11 @@ func newCoreRuntime() (*coreRuntime, error) {
 		return nil, err
 	}
 	execDir := filepath.Dir(execPath)
-	settingsPath := common.ResolveRuntimeFile(execDir, filepath.Join("config", "settings.json"))
-	rulesPath := common.ResolveRuntimeFile(execDir, filepath.Join("rules", "config.json"))
+	settingsPath := common.ConfigSettingsPath(execDir)
+	rulesPath := common.ConfigRulesPath(execDir)
 
-	ruleManager := proxy.NewRuleManager(settingsPath, rulesPath)
+	ruleManager := proxy.NewRuleManager(settingsPath, rulesPath,
+		proxy.WithLogger(corelog.Std), proxy.WithRouterDebug(os.Getenv("SNISHAPER_ROUTER_DEBUG") == "1"))
 	if err := ruleManager.LoadConfig(); err != nil {
 		return nil, err
 	}
@@ -69,22 +76,17 @@ func newCoreRuntime() (*coreRuntime, error) {
 		port = "8080"
 	}
 
-	socks5Port := ruleManager.GetSocks5Port()
-	if socks5Port == "" {
-		socks5Port = "8081"
-	}
-
 	r := &coreRuntime{
 		execPath:    execPath,
 		execDir:     execDir,
-		certPath:    filepath.Join(execDir, "cert"),
+		certPath:    common.ConfigCertDir(execDir),
 		ruleManager: ruleManager,
-		proxyServer: proxy.NewProxyServer("127.0.0.1:" + port),
+		proxyServer: proxy.NewProxyServer("127.0.0.1:"+port, proxy.WithLogger(corelog.Std)),
+		ifaces:      netiface.NewSelector(),
 		logBuffer:   common.NewRingLogWriter(5000),
 	}
 	// Initialize nativeTUN with DoH resolver
 	r.nativeTUN = singtun.NewManager(r.proxyServer.GetDoHResolver(), r.appendLog)
-	r.proxyServer.SetSocks5Addr("127.0.0.1:" + socks5Port)
 
 	if err := r.start(); err != nil {
 		return nil, err
@@ -100,31 +102,48 @@ func (r *coreRuntime) start() error {
 		r.appendLog("[core] Failed to init cert manager: " + err.Error())
 	}
 	r.proxyServer.SetRuleManager(r.ruleManager)
-	r.proxyServer.UpdateCloudflareConfig(r.ruleManager.GetCloudflareConfig())
+	r.proxyServer.UpdateCloudflareIPPool(r.ruleManager.GetCloudflareConfig().PreferredIPs)
 	r.proxyServer.SetCertGenerator(r.certManager)
 	r.proxyServer.SetLogCallback(r.appendLog)
-	r.proxyServer.SetSocks5Enabled(r.ruleManager.GetSocks5Enabled())
 	r.ruleManager.InitAutoRouter(r.proxyServer.GetDoHResolver())
 
 	r.ruleManager.SetRouteEventCallback(func(domain, mode string) {
-	r.routeEventsMu.Lock()
-	defer r.routeEventsMu.Unlock()
-	r.routeEvents = append(r.routeEvents, RouteEvent{Domain: domain, Mode: mode})
-	if len(r.routeEvents) > 200 {
-		// Create new slice to release underlying array memory
-		newSlice := make([]RouteEvent, 100)
-		copy(newSlice, r.routeEvents[len(r.routeEvents)-100:])
-		r.routeEvents = newSlice
-	}
+		r.routeEventsMu.Lock()
+		defer r.routeEventsMu.Unlock()
+		r.routeEvents = append(r.routeEvents, RouteEvent{Domain: domain, Mode: mode})
+		if len(r.routeEvents) > 200 {
+			// Create new slice to release underlying array memory
+			newSlice := make([]RouteEvent, 100)
+			copy(newSlice, r.routeEvents[len(r.routeEvents)-100:])
+			r.routeEvents = newSlice
+		}
 	})
+
+	if stop, err := r.ruleManager.WatchRulesFile(func() {
+		if err := r.reloadConfig(); err != nil {
+			r.appendLog("[core] rules file changed but reload failed: " + err.Error())
+			return
+		}
+		r.appendLog("[core] rules file changed, reloaded automatically")
+	}); err != nil {
+		r.appendLog("[core] rules file watch unavailable: " + err.Error())
+	} else {
+		r.rulesWatchStop = stop
+	}
 
 	r.appendLog("[core] runtime ready")
 	return nil
 }
 
 func (r *coreRuntime) shutdown() {
+	if r.rulesWatchStop != nil {
+		r.rulesWatchStop()
+		r.rulesWatchStop = nil
+	}
 	if r.nativeTUN != nil {
-		_ = r.nativeTUN.Stop()
+		//进程退出路径用 Shutdown：这是唯一允许终态关闭 Handler 的地方，
+		// 可确保 TUN 停止后残留派发的连接也无法再生效。
+		_ = r.nativeTUN.Shutdown()
 	}
 	_ = r.proxyServer.Stop()
 	r.appendLog("[core] runtime stopped")
@@ -145,9 +164,8 @@ func (r *coreRuntime) reloadConfig() error {
 		return err
 	}
 	r.proxyServer.SetRuleManager(r.ruleManager)
-	r.proxyServer.UpdateCloudflareConfig(r.ruleManager.GetCloudflareConfig())
+	r.proxyServer.UpdateCloudflareIPPool(r.ruleManager.GetCloudflareConfig().PreferredIPs)
 	r.proxyServer.SetCertGenerator(r.certManager)
-	r.proxyServer.SetSocks5Enabled(r.ruleManager.GetSocks5Enabled())
 	r.ruleManager.InitAutoRouter(r.proxyServer.GetDoHResolver())
 	// nativeTUN doesn't need restart on config reload
 	r.appendLog("[core] config reloaded")
@@ -240,6 +258,10 @@ func (r *coreRuntime) startProxy() error {
 	r.proxyOpMu.Lock()
 	defer r.proxyOpMu.Unlock()
 
+	if r.proxyServer.IsRunning() {
+		return nil
+	}
+
 	originalPort := r.getListenPort()
 	if originalPort == 0 {
 		originalPort = 8080
@@ -280,6 +302,11 @@ func (r *coreRuntime) stopProxy() error {
 }
 
 func (r *coreRuntime) startTUN() (err error) {
+	// 串行化 start/stop：core_api 的 TUN 请求都在各自的 goroutine 里执行，
+	// 没有互斥时连点会并发进入 singtun.Manager 的锁，表现为界面长时间无响应。
+	r.tunOpMu.Lock()
+	defer r.tunOpMu.Unlock()
+
 	r.setTUNStartState(true, nil)
 	defer func() {
 		r.setTUNStartState(false, err)
@@ -304,18 +331,27 @@ func (r *coreRuntime) startTUN() (err error) {
 		err = fmt.Errorf("proxy listen port is empty")
 		return err
 	}
+	tunCfg := r.ruleManager.GetTUNConfig()
 	r.appendLog("[core] startTUN: calling nativeTUN.Start with proxy=" + "127.0.0.1:" + listenPort)
 	proxyAddr := "127.0.0.1:" + listenPort
-	if err = r.nativeTUN.Start(r.ruleManager.GetTUNConfig(), proxyAddr); err != nil {
+	if err = r.nativeTUN.Start(tunCfg, proxyAddr); err != nil {
 		r.appendLog("[core] startTUN: nativeTUN.Start failed: " + err.Error())
 		return err
 	}
 	r.appendLog("[core] native sing-tun started, status=" + fmt.Sprintf("%v", r.nativeTUN.Status().Running))
-	// 通知 ProxyServer 启用 TUN 模式，出站连接绑物理网卡
+	// 通知 ProxyServer 启用 TUN 模式，出站连接绑物理网卡。
+	// 出站网卡在 TUN 启动之后才配置：此时网卡列表已包含 SniShaper 自己的虚拟
+	// 网卡，必须让 netiface 重新扫描，否则可能把 TUN 自己选成出站网卡。
+	// 注意 SetTUNMode 必须在 Start 成功之后：Start 失败时 TUN 并不存在，
+	// 此时打开 TUN 模式会让所有出站连接去找一张并不存在的网卡。
 	r.proxyServer.SetTUNMode(true)
+	r.ifaces.Invalidate()
+	if binding, selErr := r.ifaces.Select(netiface.FamilyIPv4, tunCfg.InterfaceConfig(), r.appendLog); selErr == nil {
+		r.appendLog("[core] TUN outbound interface: " + binding.Describe())
+	}
 	// TUN 数据面自检：通过 TUN 发送 DNS 查询，验证 gvisor 栈正常工作。
 	// 解决 gvisor 数据面静默失效时（网卡存在但流量不通）无任何错误日志的问题。
-	if err := verifyTUNDataPlane("198.18.0.1", 5*time.Second); err != nil {
+	if err := verifyTUNDataPlane(singtun.TUNGateway4(), 2*time.Second); err != nil {
 		r.appendLog("[error] TUN data plane check failed: " + err.Error())
 	} else {
 		r.appendLog("[core] TUN data plane check passed")
@@ -371,15 +407,24 @@ func verifyTUNDataPlane(tunIP string, timeout time.Duration) error {
 }
 
 func (r *coreRuntime) stopTUN() error {
+	// 与 startTUN 共用一把锁，保证同一时刻只有一个 TUN 生命周期操作在跑。
+	r.tunOpMu.Lock()
+	defer r.tunOpMu.Unlock()
+
 	r.setTUNStartState(false, nil)
 	if r.nativeTUN == nil {
 		return fmt.Errorf("native TUN manager is not initialized")
 	}
-	// 通知 ProxyServer 退出 TUN 模式
-	r.proxyServer.SetTUNMode(false)
+	// 顺序要求：必须先停 TUN 再退出 TUN 模式。
+	// 反过来的话，设备还在、默认路由还指向隧道，但出站 socket 已经不再绑物理网卡，
+	// 这段时间内所有出站流量都会被 TUN 重新捕获，形成自激回环。
 	if err := r.nativeTUN.Stop(); err != nil {
 		return err
 	}
+	// 通知 ProxyServer 退出 TUN 模式
+	r.proxyServer.SetTUNMode(false)
+	// TUN 网卡已消失，重新扫描网卡列表，避免下次出站仍引用已释放的接口索引。
+	r.ifaces.Invalidate()
 	r.appendLog("[core] native sing-tun stopped")
 	return nil
 }
@@ -388,7 +433,6 @@ func (r *coreRuntime) getTUNStatus() proxy.TUNStatus {
 	var status proxy.TUNStatus
 	if r.nativeTUN != nil {
 		status = r.nativeTUN.Status()
-		r.appendLog(fmt.Sprintf("[core] getTUNStatus: Running=%v, Message=%s", status.Running, status.Message))
 	} else {
 		status = proxy.TUNStatus{
 			Supported: false,
@@ -409,11 +453,6 @@ func (r *coreRuntime) getTUNStatus() proxy.TUNStatus {
 	}
 	status.Enabled = false
 	if starting {
-		if strings.TrimSpace(status.Message) == "" ||
-			strings.Contains(strings.ToLower(status.Message), "selected") ||
-			strings.Contains(strings.ToLower(status.Message), "not running") {
-			status.Message = "TUN startup in progress"
-		}
 		return status
 	}
 	if startErr != "" {

@@ -9,14 +9,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
-	"snishaper/proxy"
+	"snishaper/common"
+
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 // CoreClient is an RPC client that communicates with the core process.
 type CoreClient struct {
-	token string
+	startMu sync.Mutex
+	tokenMu sync.Mutex
+	token   string
 }
 
 // NewCoreClient creates a new core RPC client.
@@ -24,26 +29,55 @@ func NewCoreClient() *CoreClient {
 	return &CoreClient{}
 }
 
-func (c *CoreClient) readToken() string {
-	if c.token != "" {
-		return c.token
-	}
-	execPath, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	tokenPath := filepath.Join(filepath.Dir(execPath), "core_rpc_token")
+func (c *CoreClient) loadTokenFromDisk() string {
+	// Must match the core's token location: per-user config dir, not the
+	// (possibly user-writable) exe dir.
+	tokenPath := filepath.Join(common.UserConfigDir(), "core_rpc_token")
 	data, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return ""
 	}
-	c.token = strings.TrimSpace(string(data))
+	return strings.TrimSpace(string(data))
+}
+
+func (c *CoreClient) readToken() string {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if c.token == "" {
+		c.token = c.loadTokenFromDisk()
+	}
 	return c.token
+}
+
+func (c *CoreClient) invalidateToken() {
+	c.tokenMu.Lock()
+	c.token = ""
+	c.tokenMu.Unlock()
+}
+
+// announceToken sends the client's token announcement so the core can reject
+// connections from processes that never read the token file. One length byte
+// plus the token: the core reads exactly those bytes and the gob stream
+// starts after them.
+func announceToken(conn net.Conn, token string) error {
+	if token == "" || len(token) > maxRPCTokenLen {
+		return fmt.Errorf("rpc token unavailable")
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(coreRPCHandshakeTimeout))
+	buf := make([]byte, 0, 1+len(token))
+	buf = append(buf, byte(len(token)))
+	buf = append(buf, token...)
+	_, err := conn.Write(buf)
+	return err
 }
 
 func (c *CoreClient) dial() (*rpc.Client, error) {
 	conn, err := net.DialTimeout("tcp", coreRPCAddr, 400*time.Millisecond)
 	if err != nil {
+		return nil, err
+	}
+	if err := announceToken(conn, c.readToken()); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	return rpc.NewClient(conn), nil
@@ -59,16 +93,26 @@ func (c *CoreClient) Call(method string, args any, reply any) error {
 	return client.Call(method, args, reply)
 }
 
+// Ping reports whether the core process is reachable and accepts our token
+// (instance-scoped: a stale token from a previous core instance yields false).
+func (c *CoreClient) Ping() bool {
+	var pong BoolReply
+	return c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong) == nil && pong.Value
+}
+
 // EnsureRunning makes sure the core process is alive and responding.
 func (c *CoreClient) EnsureRunning() error {
 	return c.ensureRunningWithElevation(false)
 }
 
 func (c *CoreClient) ensureRunningWithElevation(requireElevated bool) error {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+
 	wasLogCaptureEnabled := false
 	wasProxyRunning := false
 	var pong BoolReply
-	if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err == nil && pong.Value {
+	if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err == nil && pong.Value {
 		wasLogCaptureEnabled = c.IsLogCaptureEnabled()
 		wasProxyRunning = c.IsProxyRunning()
 		execPath, pathErr := os.Executable()
@@ -85,10 +129,10 @@ func (c *CoreClient) ensureRunningWithElevation(requireElevated bool) error {
 			return nil
 		}
 		var empty EmptyArgs
-		_ = c.Call("Core.Shutdown", EmptyArgs{}, &empty)
+		_ = c.Call("Core.Shutdown", AuthArgs{Token: c.readToken()}, &empty)
 		for i := 0; i < 10; i++ {
 			time.Sleep(100 * time.Millisecond)
-			if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err != nil || !pong.Value {
+			if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err != nil || !pong.Value {
 				break
 			}
 		}
@@ -97,20 +141,13 @@ func (c *CoreClient) ensureRunningWithElevation(requireElevated bool) error {
 	if err != nil {
 		return err
 	}
+	c.invalidateToken()
 	if err := startCoreProcess(execPath, requireElevated); err != nil {
 		return err
 	}
 	for i := 0; i < 75; i++ {
 		time.Sleep(200 * time.Millisecond)
-		if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err == nil && pong.Value {
-			// Authenticate with the core process
-			token := c.readToken()
-			if token != "" {
-				var authReply BoolReply
-				if err := c.Call("Core.Authenticate", AuthArgs{Token: token}, &authReply); err != nil || !authReply.Value {
-					continue // Authentication failed, retry
-				}
-			}
+		if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err == nil && pong.Value {
 			if wasLogCaptureEnabled {
 				var empty EmptyArgs
 				_ = c.Call("Core.StartLogCapture", EmptyArgs{}, &empty)
@@ -132,6 +169,8 @@ func (c *CoreClient) ensureRunningWithElevation(requireElevated bool) error {
 			}
 			return nil
 		}
+		// ping 失败：token 文件可能尚未写入或已被新 core 覆盖，下次重读磁盘
+		c.invalidateToken()
 	}
 	return fmt.Errorf("core process did not become ready after 75 retries (15s): check admin rights, antivirus, and core process logs")
 }
@@ -145,7 +184,7 @@ func (c *CoreClient) getInfo() (CoreInfoReply, error) {
 // ReloadIfRunning tells the core to reload its configuration.
 func (c *CoreClient) ReloadIfRunning() {
 	var pong BoolReply
-	if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err != nil || !pong.Value {
+	if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err != nil || !pong.Value {
 		return
 	}
 	var empty EmptyArgs
@@ -155,21 +194,22 @@ func (c *CoreClient) ReloadIfRunning() {
 // ReloadCertificateIfRunning tells the core to reload its certificate.
 func (c *CoreClient) ReloadCertificateIfRunning() {
 	var pong BoolReply
-	if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err != nil || !pong.Value {
+	if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err != nil || !pong.Value {
 		return
 	}
 	var empty EmptyArgs
 	_ = c.Call("Core.ReloadCertificate", EmptyArgs{}, &empty)
 }
 
-// ShutdownIfRunning shuts down the core process if it's alive.
+// ShutdownIfRunning shuts down the core process if it's ours (token-scoped:
+// a stale token cannot shut down a newly started core instance).
 func (c *CoreClient) ShutdownIfRunning() {
 	var pong BoolReply
-	if err := c.Call("Core.Ping", EmptyArgs{}, &pong); err != nil || !pong.Value {
+	if err := c.Call("Core.Ping", AuthArgs{Token: c.readToken()}, &pong); err != nil || !pong.Value {
 		return
 	}
 	var empty EmptyArgs
-	_ = c.Call("Core.Shutdown", EmptyArgs{}, &empty)
+	_ = c.Call("Core.Shutdown", AuthArgs{Token: c.readToken()}, &empty)
 }
 
 func (c *CoreClient) StartProxy() error {
@@ -306,6 +346,19 @@ func (c *CoreClient) GetRouteEvents() []RouteEvent {
 		return nil
 	}
 	return reply.Events
+}
+
+// GetActiveConnections 返回 core 进程的实时连接快照；core 未运行或
+// RPC 失败时返回空切片（调用方按"无数据"呈现，而非错误）。
+func (c *CoreClient) GetActiveConnections() []proxy.ConnInfo {
+	var reply ActiveConnectionsReply
+	if err := c.Call("Core.GetActiveConnections", EmptyArgs{}, &reply); err != nil {
+		return []proxy.ConnInfo{}
+	}
+	if reply.Connections == nil {
+		return []proxy.ConnInfo{}
+	}
+	return reply.Connections
 }
 
 func (c *CoreClient) SetProxyMode(mode string) error {

@@ -4,29 +4,33 @@ import { Box, Drawer, IconButton, Tooltip, Typography, useColorScheme } from '@m
 import { Sun, Moon } from '../lib/icons';
 import logoUrl from '../assets/logo.svg';
 import {
-  LayoutDashboard,
-  ShieldCheck,
   Activity,
   FileText,
+  Link,
+  Map,
   Settings,
-  Workflow,
+  Shield,
+  RefreshCcw,
   Globe,
   Antenna,
   Info,
-  Zap,
+  Bolt,
 } from '../lib/icons';
 import { useTranslation } from '../i18n/I18nContext';
+import { SetAppearanceMode } from '../api/bindings';
 
 const DRAWER_WIDTH = 240;
 
 const getNavItems = (t: any) => [
-  { path: '/dashboard', label: t('sidebar.dashboard'), icon: LayoutDashboard },
+  { path: '/dashboard', label: t('sidebar.dashboard'), icon: Activity },
   { path: '/proxies', label: t('sidebar.proxies'), icon: Globe },
-  { path: '/rules', label: t('sidebar.rules'), icon: ShieldCheck },
-  { path: '/routing', label: t('sidebar.routing'), icon: Workflow },
+  { path: '/rules', label: t('sidebar.rules'), icon: Shield },
+  { path: '/routing', label: t('sidebar.routing'), icon: RefreshCcw },
   { path: '/dns', label: t('sidebar.dns'), icon: Antenna },
-  { path: '/evolution', label: t('evolution.title'), icon: Zap },
+  { path: '/evolution', label: t('evolution.title'), icon: Bolt },
   { path: '/logs', label: t('sidebar.logs'), icon: FileText },
+  { path: '/connections', label: t('sidebar.connections'), icon: Link },
+  { path: '/profiles', label: t('sidebar.profiles'), icon: Map },
   { path: '/settings', label: t('sidebar.settings'), icon: Settings },
   { path: '/about', label: t('sidebar.about'), icon: Info },
 ];
@@ -112,7 +116,11 @@ const SidebarContent: React.FC = () => {
           <IconButton
             size="small"
             aria-label={mode === 'light' ? t('sidebar.dark_mode_aria') : t('sidebar.light_mode_aria')}
-            onClick={() => setMode(mode === 'light' ? 'dark' : 'light')}
+            onClick={() => {
+              const next = mode === 'light' ? 'dark' : 'light';
+              setMode(next);
+              SetAppearanceMode(next).catch(() => {});
+            }}
             color={mode === 'dark' ? 'primary' : 'default'}
           >
             {mode === 'light' ? <Sun size={18} /> : <Moon size={18} />}

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -8,20 +10,21 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/admpub/go-download/v2"
+
+	"snishaper/pkg/sysproxy"
 )
 
 const (
-	githubRepo      = "SniShaper/SniShaper"
+	githubRepo      = "SnishaperTeam/SniShaper"
 	githubAPIBase   = "https://api.github.com/repos/" + githubRepo
 	githubProxyBase = "https://gh.llkk.cc/"
 	updateUserAgent = "SniShaper-Update/1.0"
@@ -38,19 +41,30 @@ var downloadSourceOrder = []string{
 }
 
 var downloadSources = map[string]string{
-	"direct":              "",
-	"down.mxw.qzz.io":     "https://down.mxw.qzz.io/",
-	"gh-proxy.org":        "https://gh-proxy.org/",
-	"v4.gh-proxy.org":     "https://v4.gh-proxy.org/",
-	"v6.gh-proxy.org":     "https://v6.gh-proxy.org/",
-	"cdn.gh-proxy.org":    "https://cdn.gh-proxy.org/",
+	"smart":                "",
+	"direct":               "",
+	"down.mxw.qzz.io":      "https://down.mxw.qzz.io/",
+	"gh-proxy.org":         "https://gh-proxy.org/",
+	"v4.gh-proxy.org":      "https://v4.gh-proxy.org/",
+	"v6.gh-proxy.org":      "https://v6.gh-proxy.org/",
+	"cdn.gh-proxy.org":     "https://cdn.gh-proxy.org/",
 	"axisnow.gh-proxy.org": "https://axisnow.gh-proxy.org/",
-	"custom":              "",
+	"custom":               "",
 }
 
 const defaultDownloadSource = "down.mxw.qzz.io"
 
-var buildVersion string
+const smartSourceCacheTTL = 10 * time.Minute
+
+const (
+	sourcePurposeRelease = "release"
+	sourcePurposeRaw     = "raw"
+)
+
+var sourceProbes = map[string]string{
+	sourcePurposeRelease: "https://github.com/" + githubRepo + "/releases/latest",
+	sourcePurposeRaw:     "https://raw.githubusercontent.com/" + githubRepo + "/main/rules/config.json",
+}
 
 type githubRelease struct {
 	TagName    string        `json:"tag_name"`
@@ -65,6 +79,9 @@ type githubAsset struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
 	DownloadURL string `json:"browser_download_url"`
+	// Digest is the "sha256:..." digest reported by the GitHub Releases API.
+	// Only the value from the official api.github.com endpoint is trusted.
+	Digest string `json:"digest"`
 }
 
 var validUpdateChannels = map[string]string{
@@ -114,6 +131,27 @@ func (a *App) SetCustomDownloadSource(prefix string) error {
 	return a.ruleManager.SetCustomDownloadSource(prefix)
 }
 
+// UpdateChannels lists the channels CheckUpdate accepts, so callers can show
+// the valid values instead of hardcoding them.
+func UpdateChannels() []string {
+	names := make([]string, 0, len(validUpdateChannels))
+	for name := range validUpdateChannels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// DownloadSources lists the download source prefixes the updater understands.
+func DownloadSources() []string {
+	names := make([]string, 0, len(downloadSources))
+	for name := range downloadSources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 type DownloadSourceStatus struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"`
@@ -134,7 +172,7 @@ func (a *App) MeasureDownloadSources() []DownloadSourceStatus {
 		wg.Add(1)
 		go func(i int, tg target) {
 			defer wg.Done()
-			results[i] = measureSourceLatency(tg.name, tg.prefix)
+			results[i] = measureSourceLatency(tg.name, tg.prefix, sourceProbes[sourcePurposeRelease])
 		}(i, tg)
 	}
 	wg.Wait()
@@ -147,15 +185,18 @@ func (a *App) MeasureDownloadSources() []DownloadSourceStatus {
 	return results
 }
 
-func measureSourceLatency(name, prefix string) DownloadSourceStatus {
-	probe := "https://github.com/SniShaper/SniShaper/releases/latest"
+func measureSourceLatency(name, prefix, probe string) DownloadSourceStatus {
+	target := probe
 	if prefix != "" {
-		probe = prefix + probe
+		target = prefix + probe
 	}
-	st := DownloadSourceStatus{Name: name, URL: probe}
-	client := &http.Client{Timeout: 5 * time.Second}
+	st := DownloadSourceStatus{Name: name, URL: target}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: sysproxy.UpstreamProxyFunc()},
+	}
 	start := time.Now()
-	req, err := http.NewRequest(http.MethodHead, probe, nil)
+	req, err := http.NewRequest(http.MethodHead, target, nil)
 	if err != nil {
 		st.Error = err.Error()
 		return st
@@ -168,11 +209,125 @@ func measureSourceLatency(name, prefix string) DownloadSourceStatus {
 		return st
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		st.Error = fmt.Sprintf("http status %d", resp.StatusCode)
+		return st
+	}
 	st.OK = true
 	return st
 }
 
+type downloadSourceEntry struct {
+	label  string
+	prefix string
+}
+
+// rankedSourceOrder measures every mirror against the probe for the given
+// purpose and returns the reachable ones fastest first, so the "smart" source
+// always points at the quickest mirror for that kind of request.
+func (a *App) rankedSourceOrder(purpose string) []string {
+	probe, ok := sourceProbes[purpose]
+	if !ok {
+		probe = sourceProbes[sourcePurposeRelease]
+	}
+
+	a.sourceRankMu.Lock()
+	cached, at := a.sourceRankCache[purpose], a.sourceRankAt[purpose]
+	a.sourceRankMu.Unlock()
+	if len(cached) > 0 && time.Since(at) < smartSourceCacheTTL {
+		return cached
+	}
+
+	names := append([]string{"direct"}, downloadSourceOrder...)
+	type sample struct {
+		name      string
+		latencyMS int64
+		ok        bool
+	}
+	samples := make([]sample, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			st := measureSourceLatency(name, downloadSources[name], probe)
+			samples[i] = sample{name: name, latencyMS: st.LatencyMS, ok: st.OK}
+		}(i, name)
+	}
+	wg.Wait()
+
+	sort.SliceStable(samples, func(i, j int) bool {
+		if samples[i].ok != samples[j].ok {
+			return samples[i].ok
+		}
+		return samples[i].latencyMS < samples[j].latencyMS
+	})
+	order := make([]string, 0, len(samples))
+	for _, s := range samples {
+		if s.ok {
+			order = append(order, s.name)
+		}
+	}
+	if len(order) == 0 {
+		order = names
+	}
+
+	a.sourceRankMu.Lock()
+	if a.sourceRankCache == nil {
+		a.sourceRankCache = map[string][]string{}
+		a.sourceRankAt = map[string]time.Time{}
+	}
+	a.sourceRankCache[purpose], a.sourceRankAt[purpose] = order, time.Now()
+	a.sourceRankMu.Unlock()
+	a.appendLog(fmt.Sprintf("[update] smart source ranking (%s): %s", purpose, strings.Join(order, " > ")))
+	return order
+}
+
+// downloadSourceEntries lists the mirrors to try for the configured download
+// source, in order: the configured one first, then direct, then the rest.
+func (a *App) downloadSourceEntries(purpose string) []downloadSourceEntry {
+	src := a.GetDownloadSource()
+	entries := []downloadSourceEntry{}
+	seen := map[string]bool{}
+	add := func(label, prefix string) {
+		if seen[prefix] {
+			return
+		}
+		seen[prefix] = true
+		entries = append(entries, downloadSourceEntry{label: label, prefix: prefix})
+	}
+
+	switch src {
+	case "custom":
+		if p := strings.TrimRight(a.GetCustomDownloadSource(), "/"); p != "" {
+			add("custom", p+"/")
+		}
+	case "smart":
+		for _, name := range a.rankedSourceOrder(purpose) {
+			add(name, downloadSources[name])
+		}
+	case "direct", "":
+		add("direct", "")
+	default:
+		if p, ok := downloadSources[src]; ok {
+			add(src, p)
+		}
+	}
+
+	add("direct", "")
+	for _, name := range downloadSourceOrder {
+		if name == src {
+			continue
+		}
+		add(name, downloadSources[name])
+	}
+	return entries
+}
+
 func (a *App) GetReleaseChannel() string {
+	if ch := strings.TrimSpace(buildChannel); ch != "" {
+		return normalizeReleaseChannel(ch)
+	}
 	if ch, err := manifestChannel(); err == nil && ch != "" {
 		return normalizeReleaseChannel(ch)
 	}
@@ -186,111 +341,32 @@ func (a *App) GetCurrentVersionFull() string {
 	return a.GetAppVersion()
 }
 
-func normalizeReleaseChannel(ch string) string {
-	v := strings.ToLower(strings.TrimSpace(ch))
-	if i := strings.Index(v, "."); i > 0 {
-		v = v[:i]
-	}
-	switch v {
-	case "alpha":
-		return "alpha"
-	case "beta":
-		return "beta"
-	case "rc", "rc1", "releasecandidate", "release-candidate", "candidate":
-		return "rc"
-	case "stable", "release", "official", "final":
-		return "stable"
-	default:
-		return "stable"
-	}
-}
-
-func manifestChannel() (string, error) {
-	dir := filepath.Dir(os.Args[0])
-	var lastErr error
-	for {
-		for _, name := range []string{"Package.appxmanifest", "AppxManifest.xml"} {
-			data, err := os.ReadFile(filepath.Join(dir, name))
-			if err != nil {
-				continue
-			}
-			var pkg struct {
-				Channel string `xml:"http://schemas.snishaper.dev/release ReleaseChannel"`
-			}
-			if err := xml.Unmarshal(data, &pkg); err != nil {
-				lastErr = err
-				continue
-			}
-			if strings.TrimSpace(pkg.Channel) != "" {
-				return strings.TrimSpace(pkg.Channel), nil
-			}
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	if lastErr != nil {
-		return "", lastErr
-	}
-	return "", fmt.Errorf("manifest not found")
-}
-
-func manifestVersionFull() (string, error) {
-	dir := filepath.Dir(os.Args[0])
-	var lastErr error
-	identityFallback := ""
-	for {
-		for _, name := range []string{"Package.appxmanifest", "AppxManifest.xml"} {
-			data, err := os.ReadFile(filepath.Join(dir, name))
-			if err != nil {
-				continue
-			}
-			var pkg struct {
-				RelVersion string `xml:"http://schemas.snishaper.dev/release Version"`
-				RelChannel string `xml:"http://schemas.snishaper.dev/release ReleaseChannel"`
-				Identity   struct {
-					Version string `xml:"Version,attr"`
-				} `xml:"Identity"`
-			}
-			if err := xml.Unmarshal(data, &pkg); err != nil {
-				lastErr = err
-				continue
-			}
-			rv := strings.TrimSpace(pkg.RelVersion)
-			rc := strings.TrimSpace(pkg.RelChannel)
-			if rv != "" {
-				if rc != "" && normalizeReleaseChannel(rc) != "stable" {
-					return rv + "-" + rc, nil
-				}
-				return rv, nil
-			}
-			if identityFallback == "" && pkg.Identity.Version != "" {
-				parts := strings.Split(pkg.Identity.Version, ".")
-				for len(parts) > 1 && parts[len(parts)-1] == "0" {
-					parts = parts[:len(parts)-1]
-				}
-				identityFallback = strings.Join(parts, ".")
-			}
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	if identityFallback != "" {
-		return identityFallback, nil
-	}
-	if lastErr != nil {
-		return "", lastErr
-	}
-	return "", fmt.Errorf("manifest not found")
-}
-
 func (a *App) CheckUpdate() CheckUpdateResult {
 	channel := a.GetUpdateChannel()
+	// 免限流快路径：releases.atom 是 github.com 网页端点，不占 REST API
+	// 60 次/小时的配额。日常检查在「已是最新」时不再触发任何 API 请求。
+	if tags, err := fetchRecentReleaseTags(); err == nil {
+		if rel := resolveChannelRelease(atomReleases(tags), channel); rel != nil {
+			latestVersion := strings.TrimPrefix(rel.TagName, "v")
+			switch compareReleaseVersions(a.GetCurrentVersionFull(), a.GetReleaseChannel(), latestVersion, channelFromTag(rel.TagName)) {
+			case 0:
+				return CheckUpdateResult{
+					HasUpdate:     false,
+					LatestVersion: latestVersion,
+					Channel:       channel,
+					Message:       "up_to_date",
+				}
+			case 1:
+				return CheckUpdateResult{
+					HasUpdate:     false,
+					LatestVersion: latestVersion,
+					Channel:       channel,
+					Message:       "dev_version",
+				}
+			}
+			// case -1：有新版本，继续走 API 拿完整发布信息与资产列表。
+		}
+	}
 	releases, err := a.fetchGitHubReleases()
 	if err != nil {
 		a.appendLog("[update] Failed to fetch releases: " + err.Error())
@@ -351,62 +427,288 @@ func (a *App) CheckUpdate() CheckUpdateResult {
 
 func (a *App) fetchGitHubReleases() ([]githubRelease, error) {
 	apiURL := githubAPIBase + "/releases?per_page=100"
-	urls := []string{apiURL, githubProxyBase + apiURL}
-	var lastErr error
-	for _, u := range urls {
-		req, err := http.NewRequest(http.MethodGet, u, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", updateUserAgent)
-		req.Header.Set("Accept", "application/vnd.github+json")
-		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			return nil, fmt.Errorf("rate_limited")
-		}
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("http status %d", resp.StatusCode)
-			resp.Body.Close()
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		var releases []githubRelease
-		if err := json.Unmarshal(body, &releases); err != nil {
-			lastErr = err
-			continue
-		}
+	// Official API first; mirrors are only a fallback for listing releases.
+	releases, err := fetchReleasesFromURL(apiURL)
+	if err == nil {
 		return releases, nil
 	}
-	return nil, lastErr
+	if mirrorReleases := fetchReleasesFromMirrors(mirrorAPIPrefixes(), apiURL); len(mirrorReleases) > 0 {
+		return mirrorReleases, nil
+	}
+	return nil, err
 }
 
-func resolveChannelRelease(releases []githubRelease, channel string) *githubRelease {
-	keyword := validUpdateChannels[channel]
-	for i := range releases {
-		rel := &releases[i]
-		if channel == "stable" {
-			if !rel.Prerelease {
-				return rel
-			}
-			continue
+// mirrorAPIPrefixes lists the gh-proxy prefixes tried when the official API is
+// unreachable. Every one of them can proxy api.github.com requests.
+func mirrorAPIPrefixes() []string {
+	prefixes := []string{githubProxyBase}
+	for _, name := range downloadSourceOrder {
+		if u, ok := downloadSources[name]; ok && u != "" {
+			prefixes = append(prefixes, u)
 		}
-		if rel.Prerelease && keyword != "" && strings.Contains(strings.ToLower(rel.TagName), keyword) {
-			return rel
+	}
+	return prefixes
+}
+
+// fetchReleasesFromMirrors races the mirror prefixes in parallel and returns
+// the first successful response, so one dead or rate-limited mirror no longer
+// blocks the version check.
+//
+// Deliberately NO cache-bust query param: on the gh-proxy family a changed
+// query string makes Cloudflare BYPASS its cache and hit their backend, whose
+// shared GitHub token is rate-limited (403). The plain URL stays cache-hit
+// eligible, which is also the faster path.
+func fetchReleasesFromMirrors(prefixes []string, apiURL string) []githubRelease {
+	type outcome struct {
+		releases []githubRelease
+		ok       bool
+	}
+	ch := make(chan outcome, len(prefixes))
+	for _, prefix := range prefixes {
+		go func(p string) {
+			releases, err := fetchReleasesFromURL(p + apiURL)
+			ch <- outcome{releases, err == nil}
+		}(prefix)
+	}
+	for range prefixes {
+		if o := <-ch; o.ok {
+			return o.releases
 		}
 	}
 	return nil
+}
+
+func fetchReleasesFromURL(apiURL string) ([]githubRelease, error) {
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", updateUserAgent)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	client := &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: &http.Transport{Proxy: sysproxy.UpstreamProxyFunc()},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		resp.Body.Close()
+		return nil, fmt.Errorf("rate_limited")
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("http status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	var releases []githubRelease
+	if err := json.Unmarshal(body, &releases); err != nil {
+		return nil, err
+	}
+	return releases, nil
+}
+
+const githubReleasesAtom = "https://github.com/" + githubRepo + "/releases.atom"
+
+// releasesFeed 是 releases.atom 中更新检查需要的部分。真 tag 在 entry 的
+// <link href>（…/releases/tag/<tag>）里；<title> 是发布名（如
+// "SniShaper v1.30.2"），不是 tag——把它当版本解析会把 "SniShaper v1"
+// 解析成 0，导致旧发布反超新发布的错误排序，所以只认 link。
+type releasesFeed struct {
+	Entries []struct {
+		Links []struct {
+			Href string `xml:"href,attr"`
+		} `xml:"link"`
+	} `xml:"entry"`
+}
+
+// fetchRecentReleaseTags 读取 releases.atom（最近 ~10 个发布，含预发布）。
+// 该端点由 github.com 网页侧提供，不计入 REST API 配额，不会被限流。
+func fetchRecentReleaseTags() ([]string, error) {
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{Proxy: sysproxy.UpstreamProxyFunc()},
+	}
+	req, err := http.NewRequest(http.MethodGet, githubReleasesAtom, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", updateUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http status %d", resp.StatusCode)
+	}
+	return parseReleasesFeed(resp.Body)
+}
+
+func parseReleasesFeed(r io.Reader) ([]string, error) {
+	var feed releasesFeed
+	if err := xml.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&feed); err != nil {
+		return nil, err
+	}
+	const marker = "/releases/tag/"
+	tags := make([]string, 0, len(feed.Entries))
+	for _, e := range feed.Entries {
+		for _, l := range e.Links {
+			if i := strings.Index(l.Href, marker); i >= 0 {
+				if tag := strings.Trim(l.Href[i+len(marker):], "/"); tag != "" {
+					tags = append(tags, tag)
+					break
+				}
+			}
+		}
+	}
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("no entries in releases feed")
+	}
+	return tags, nil
+}
+
+// atomReleases 把 feed 里的 tag 转成伪发布对象，让渠道选择与版本比较
+// 直接复用 API 路径的现有逻辑。
+func atomReleases(tags []string) []githubRelease {
+	releases := make([]githubRelease, 0, len(tags))
+	for _, tag := range tags {
+		releases = append(releases, githubRelease{
+			TagName:    tag,
+			Prerelease: channelFromTag(tag) != "stable",
+		})
+	}
+	return releases
+}
+
+// fetchOfficialAssetDigest resolves the expected SHA-256 of a release asset
+// from the official GitHub API. Mirror responses are never used here.
+func (a *App) fetchOfficialAssetDigest(assetURL string) (string, error) {
+	releases, err := fetchReleasesFromURL(githubAPIBase + "/releases?per_page=100")
+	if err != nil {
+		return "", err
+	}
+	for _, rel := range releases {
+		for _, asset := range rel.Assets {
+			if asset.DownloadURL != assetURL {
+				continue
+			}
+			digest := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(asset.Digest)), "sha256:")
+			if digest == "" {
+				return "", fmt.Errorf("official GitHub API did not provide a digest for %s", asset.Name)
+			}
+			return digest, nil
+		}
+	}
+	return "", fmt.Errorf("asset not found on official GitHub releases: %s", assetURL)
+}
+
+func resolveChannelRelease(releases []githubRelease, channel string) *githubRelease {
+	threshold := channelRank(channel)
+	var best *githubRelease
+	for i := range releases {
+		rel := &releases[i]
+		if releaseRank(*rel) < threshold {
+			continue
+		}
+		if best == nil {
+			best = rel
+			continue
+		}
+		if compareReleaseVersions(
+			strings.TrimPrefix(best.TagName, "v"), channelFromTag(best.TagName),
+			strings.TrimPrefix(rel.TagName, "v"), channelFromTag(rel.TagName),
+		) == -1 {
+			best = rel
+		}
+	}
+	return best
+}
+
+func releaseRank(rel githubRelease) int {
+	if !rel.Prerelease {
+		return 3
+	}
+	switch channelFromTag(rel.TagName) {
+	case "rc":
+		return 2
+	case "beta":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// assetArchToken maps the architecture tokens used in release asset names to
+// one canonical value, so amd64/x64 and 386/x86 compare equal.
+func assetArchToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "arm64"), strings.Contains(lower, "aarch64"):
+		return "arm64"
+	case strings.Contains(lower, "x86_64"), strings.Contains(lower, "amd64"),
+		strings.Contains(lower, "x64"):
+		return "x64"
+	case strings.Contains(lower, "386"), strings.Contains(lower, "x86"):
+		return "x86"
+	}
+	return ""
+}
+
+func runtimeAssetArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x86"
+	case "arm64":
+		return "arm64"
+	}
+	return runtime.GOARCH
+}
+
+// assetOSToken resolves the target OS of an asset name; an installer named
+// only by its .exe suffix belongs to Windows.
+func assetOSToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "windows"):
+		return "windows"
+	case strings.Contains(lower, "linux"):
+		return "linux"
+	case strings.Contains(lower, "darwin"), strings.Contains(lower, "macos"), strings.Contains(lower, "osx"):
+		return "darwin"
+	case strings.HasSuffix(lower, ".exe"):
+		return "windows"
+	}
+	return ""
+}
+
+func isCLIAsset(lower string) bool {
+	return strings.HasPrefix(lower, "snishaper-cli-")
+}
+
+// assetMatchesRuntime keeps only the packages the running process can install:
+// same OS, same architecture, and the flavour of this binary. The signed MSIX
+// bundle (dongle.*.zip / dongle.*.7z) is dropped as well, since it carries no
+// snishaper.exe the in-app updater could extract.
+func assetMatchesRuntime(lower string) bool {
+	if strings.Contains(lower, "unsigned") || strings.HasPrefix(lower, "dongle.") {
+		return false
+	}
+	if strings.HasPrefix(lower, "snishaperupdater-") || strings.HasSuffix(lower, "-update.zip") {
+		return false
+	}
+	if isCLIAsset(lower) != headlessBuild {
+		return false
+	}
+	if osName := assetOSToken(lower); osName != "" && osName != runtime.GOOS {
+		return false
+	}
+	return assetArchToken(lower) == runtimeAssetArch()
 }
 
 func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
@@ -417,9 +719,22 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 		switch {
 		case strings.HasSuffix(lower, ".exe"):
 			kind = "exe"
-		case strings.HasSuffix(lower, ".7z") && !strings.Contains(lower, "_x64.7z") && !strings.Contains(lower, "_x86.7z") && !strings.Contains(lower, "_arm64.7z") && !strings.Contains(lower, "unsigned"):
+		case strings.HasSuffix(lower, ".zip"):
+			// Portable bundle in the format every supported Windows version
+			// can open on its own; macOS ships its .app as a zip as well.
+			kind = "zip"
+		case strings.HasSuffix(lower, ".7z"):
+			// Legacy archive kept for releases published before the switch
+			// to zip: the Windows installer still understands it.
 			kind = "7z"
+		case strings.HasSuffix(lower, ".tar.gz"):
+			// Portable bundle used by the Linux build, and the only archive
+			// the Linux installer can unpack on its own.
+			kind = "tar.gz"
 		default:
+			continue
+		}
+		if !assetMatchesRuntime(lower) {
 			continue
 		}
 		result = append(result, ReleaseAsset{
@@ -429,10 +744,29 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 			Kind:        kind,
 		})
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return assetKindRank(result[i].Kind) < assetKindRank(result[j].Kind)
+	})
 	return result
 }
 
-func buildDownloadURLs(assetURL, preferred, customPrefix string) []string {
+// assetKindRank orders the update list: installer first, then the portable
+// zip, then the legacy 7z archive, then the tarball the Linux build installs
+// from. A release that ships both formats therefore offers the one Windows 10
+// can open natively.
+func assetKindRank(kind string) int {
+	switch kind {
+	case "exe":
+		return 0
+	case "zip":
+		return 1
+	case "7z":
+		return 2
+	}
+	return 3
+}
+
+func buildDownloadURLs(assetURL string, entries []downloadSourceEntry) []string {
 	seen := map[string]bool{}
 	var urls []string
 	add := func(u string) {
@@ -445,20 +779,10 @@ func buildDownloadURLs(assetURL, preferred, customPrefix string) []string {
 		add(assetURL)
 		return urls
 	}
-	if p := downloadSources[preferred]; p != "" {
-		add(p + assetURL)
-	} else if preferred == "custom" {
-		add(strings.TrimRight(customPrefix, "/") + "/" + assetURL)
+	for _, e := range entries {
+		add(e.prefix + assetURL)
 	}
 	add(assetURL)
-	for _, k := range downloadSourceOrder {
-		if k == preferred {
-			continue
-		}
-		if p := downloadSources[k]; p != "" {
-			add(p + assetURL)
-		}
-	}
 	return urls
 }
 
@@ -505,20 +829,6 @@ func channelRank(ch string) int {
 		return 2
 	default:
 		return 3
-	}
-}
-
-func channelFromTag(tag string) string {
-	lower := strings.ToLower(tag)
-	switch {
-	case strings.Contains(lower, "-alpha"):
-		return "alpha"
-	case strings.Contains(lower, "-beta"):
-		return "beta"
-	case strings.Contains(lower, "-rc"):
-		return "rc"
-	default:
-		return "stable"
 	}
 }
 
@@ -572,7 +882,29 @@ func compareReleaseVersions(current, currentChannel, target, targetChannel strin
 	return 0
 }
 
+// fileSHA256Hex streams a file through SHA-256 and returns the lowercase hex digest.
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
+	// Resolve the expected SHA-256 from the official GitHub API before
+	// downloading. Without a trusted digest the update is rejected outright.
+	expectedSHA, err := a.fetchOfficialAssetDigest(assetURL)
+	if err != nil {
+		a.appendLog("[update] Integrity check unavailable (official GitHub API): " + err.Error())
+		return DownloadResult{}, fmt.Errorf("update integrity check unavailable: %v", err)
+	}
+
 	fileName := filepath.Base(strings.SplitN(assetURL, "?", 2)[0])
 	if fileName == "." || fileName == "/" || fileName == "" {
 		fileName = "snishaper-update.bin"
@@ -582,7 +914,7 @@ func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
 		return DownloadResult{}, err
 	}
 	dest := filepath.Join(dir, fileName)
-	urls := buildDownloadURLs(assetURL, a.ruleManager.GetDownloadSource(), a.ruleManager.GetCustomDownloadSource())
+	urls := buildDownloadURLs(assetURL, a.downloadSourceEntries(sourcePurposeRelease))
 	var lastErr error
 	for _, u := range urls {
 		if err := a.downloadFileWithProgress(u, dest, fileName); err != nil {
@@ -590,70 +922,196 @@ func (a *App) DownloadUpdateAsset(assetURL string) (DownloadResult, error) {
 			a.appendLog("[update] Download attempt failed: " + u + " -> " + err.Error())
 			continue
 		}
-		a.SetPendingUpdate(dest)
+		// Verify the downloaded bytes; a tampered mirror is treated like a
+		// failed download and the next source is tried.
+		sum, hashErr := fileSHA256Hex(dest)
+		if hashErr != nil {
+			lastErr = hashErr
+			os.Remove(dest)
+			a.appendLog("[update] Hashing failed for " + dest + ": " + hashErr.Error())
+			continue
+		}
+		if !strings.EqualFold(sum, expectedSHA) {
+			lastErr = fmt.Errorf("integrity check failed for %s: expected sha256 %s, got %s", fileName, expectedSHA, sum)
+			os.Remove(dest)
+			a.appendLog("[update] " + lastErr.Error())
+			continue
+		}
+		a.setPendingUpdateVerified(dest, expectedSHA)
 		return DownloadResult{LocalPath: dest, Size: fileSize(dest)}, nil
 	}
 	return DownloadResult{}, lastErr
 }
 
+const (
+	defaultDownloadConcurrency = 10
+	defaultDownloadChunkSize   = 8 * 1024 * 1024
+)
+
+// initDownloadTuning resolves the env-tunable download settings once at
+// startup, so the download goroutines read plain fields instead of racing on
+// lazy writes.
+func initDownloadTuning() (concurrency int, chunkSize int64) {
+	concurrency = defaultDownloadConcurrency
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("DOWNLOAD_CONCURRENCY"))); err == nil && v > 0 {
+		concurrency = v
+	}
+	chunkSize = defaultDownloadChunkSize
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("DOWNLOAD_CHUNK_SIZE")), 10, 64); err == nil && v > 0 {
+		chunkSize = v
+	}
+	return concurrency, chunkSize
+}
+
+func (a *App) getDownloadConcurrency() int {
+	if a.downloadConcurrency > 0 {
+		return a.downloadConcurrency
+	}
+	return defaultDownloadConcurrency
+}
+
+func (a *App) getDownloadChunkSize() int64 {
+	if a.downloadChunkSize > 0 {
+		return a.downloadChunkSize
+	}
+	return defaultDownloadChunkSize
+}
+
+func (a *App) downloadConcurrencyFn() download.ConcurrencyFn {
+	conc := a.getDownloadConcurrency()
+	chunk := a.getDownloadChunkSize()
+	return func(size int64) int {
+		n := conc
+		if chunk > 0 && size > 0 {
+			if byChunk := int(size / chunk); byChunk > 0 && byChunk < n {
+				n = byChunk
+			}
+		}
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
+}
+
+type downloadProgress struct {
+	a         *App
+	name      string
+	mu        sync.Mutex
+	received  int64
+	total     int64
+	lastEmit  time.Time
+	lastBytes int64
+}
+
+type progressReader struct {
+	prog *downloadProgress
+	r    io.Reader
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.prog.add(int64(n))
+	}
+	return n, err
+}
+
+func (p *downloadProgress) addTotal(n int64) {
+	p.mu.Lock()
+	p.total += n
+	p.mu.Unlock()
+}
+
+func (p *downloadProgress) add(n int64) {
+	p.mu.Lock()
+	p.received += n
+	now := time.Now()
+	if now.Sub(p.lastEmit) <= 150*time.Millisecond {
+		p.mu.Unlock()
+		return
+	}
+	elapsed := now.Sub(p.lastEmit).Seconds()
+	var speed float64
+	if elapsed > 0 {
+		speed = float64(p.received-p.lastBytes) / elapsed
+	}
+	p.lastEmit = now
+	p.lastBytes = p.received
+	received, total, name := p.received, p.total, p.name
+	a := p.a
+	p.mu.Unlock()
+	a.emitDownloadProgress(name, received, total, speed)
+}
+
+func (p *downloadProgress) finish(written int64) {
+	p.mu.Lock()
+	received := p.received
+	if written > received {
+		received = written
+	}
+	total := p.total
+	if total < received {
+		total = received
+	}
+	name := p.name
+	a := p.a
+	p.mu.Unlock()
+	a.emitDownloadProgress(name, received, total, 0)
+}
+
 func (a *App) downloadFileWithProgress(url, dest, name string) error {
+	if a.ctx.Err() != nil {
+		return a.ctx.Err()
+	}
 	transport := &http.Transport{
+		Proxy:                 sysproxy.UpstreamProxyFunc(),
 		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	client := &http.Client{Transport: transport}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+
+	progress := &downloadProgress{
+		a:        a,
+		name:     name,
+		lastEmit: time.Now(),
+	}
+
+	options := &download.Options{
+		Concurrency: a.downloadConcurrencyFn(),
+		Client: func() http.Client {
+			return *client
+		},
+		Request: func(r *http.Request) {
+			r.Header.Set("User-Agent", updateUserAgent)
+		},
+		Proxy: func(_ string, _ int, size int64, r io.Reader) io.Reader {
+			progress.addTotal(size)
+			return &progressReader{prog: progress, r: r}
+		},
+	}
+
+	f, err := download.OpenContext(a.ctx, url, options)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", updateUserAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http status %d", resp.StatusCode)
-	}
+	defer f.Close()
+
 	tmp := dest + ".part"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	defer func() {
+		out.Close()
 		if _, statErr := os.Stat(tmp); statErr == nil {
 			os.Remove(tmp)
 		}
 	}()
-	total := resp.ContentLength
-	var received int64
-	var speed float64
-	lastEmit := time.Now()
-	lastBytes := int64(0)
-	buf := make([]byte, 256*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := out.Write(buf[:n]); werr != nil {
-				return werr
-			}
-			received += int64(n)
-			if time.Since(lastEmit) > 150*time.Millisecond {
-				now := time.Now()
-				if elapsed := now.Sub(lastEmit).Seconds(); elapsed > 0 {
-					speed = float64(received-lastBytes) / elapsed
-				}
-				lastEmit = now
-				lastBytes = received
-				a.emitDownloadProgress(name, received, total, speed)
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return rerr
-		}
+
+	written, err := io.Copy(out, f)
+	if err != nil {
+		return err
 	}
 	if err := out.Close(); err != nil {
 		return err
@@ -661,7 +1119,7 @@ func (a *App) downloadFileWithProgress(url, dest, name string) error {
 	if err := os.Rename(tmp, dest); err != nil {
 		return err
 	}
-	a.emitDownloadProgress(name, received, total, speed)
+	progress.finish(written)
 	return nil
 }
 
@@ -670,11 +1128,11 @@ func (a *App) emitDownloadProgress(name string, received, total int64, speed flo
 	if total > 0 {
 		percent = float64(received) / float64(total) * 100
 	}
-	application.InvokeAsync(func() {
-		if a.mainWindow == nil || a.shouldQuit {
+	a.invokeAsync(func() {
+		if !a.hasUI() || a.shouldQuit {
 			return
 		}
-		a.mainWindow.EmitEvent("update:download_progress", map[string]interface{}{
+		a.emitEvent("update:download_progress", map[string]interface{}{
 			"asset_name": name,
 			"received":   received,
 			"total":      total,
@@ -701,146 +1159,45 @@ func (a *App) SetPendingUpdate(path string) {
 	a.pendingUpdateMu.Lock()
 	defer a.pendingUpdateMu.Unlock()
 	a.pendingUpdatePath = path
+	a.pendingUpdateSHA = ""
+}
+
+// setPendingUpdateVerified records the verified download together with the
+// SHA-256 it was validated against, so the installer can re-check the file
+// right before executing it.
+func (a *App) setPendingUpdateVerified(path, expectedSHA string) {
+	a.pendingUpdateMu.Lock()
+	defer a.pendingUpdateMu.Unlock()
+	a.pendingUpdatePath = path
+	a.pendingUpdateSHA = expectedSHA
 }
 
 func (a *App) InstallUpdateAsset(localPath string) error {
-	lower := strings.ToLower(localPath)
-	var err error
-	switch {
-	case strings.HasSuffix(lower, ".exe"):
-		err = a.launchInstaller(localPath)
-	case strings.HasSuffix(lower, ".7z"):
-		err = a.installSevenZ(localPath)
-	default:
-		err = fmt.Errorf("unsupported update file type: %s", localPath)
+	// Only the file this session downloaded and hash-verified may be
+	// installed. This binding executes a binary with the app's privileges,
+	// so an arbitrary caller-supplied path must never reach the installer —
+	// anything else goes through DownloadUpdateAsset first.
+	a.pendingUpdateMu.Lock()
+	pendingPath, expectedSHA := a.pendingUpdatePath, a.pendingUpdateSHA
+	a.pendingUpdateMu.Unlock()
+	if pendingPath == "" || expectedSHA == "" {
+		return fmt.Errorf("no verified update download; run the update download step first")
 	}
+	if !strings.EqualFold(localPath, pendingPath) {
+		return fmt.Errorf("refusing to install %s: it is not the verified update download", localPath)
+	}
+	sum, err := fileSHA256Hex(localPath)
+	if err != nil {
+		return fmt.Errorf("update integrity re-check failed: %v", err)
+	}
+	if !strings.EqualFold(sum, expectedSHA) {
+		return fmt.Errorf("update file changed after download (sha256 mismatch), refusing to install")
+	}
+	err = a.installUpdateAsset(localPath, expectedSHA)
 	if err == nil {
 		a.SetPendingUpdate("")
 	}
 	return err
-}
-
-func (a *App) launchInstaller(localPath string) error {
-	a.appendLog("[update] Launching installer: " + localPath)
-	cmd := exec.Command(localPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start installer: %v", err)
-	}
-	go func() {
-		_ = cmd.Wait()
-	}()
-	return nil
-}
-
-func (a *App) installSevenZ(localPath string) error {
-	execPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot locate application directory: %v", err)
-	}
-	execDir := filepath.Dir(execPath)
-	if !isDirWritable(execDir) {
-		return fmt.Errorf("dir_not_writable")
-	}
-	base := filepath.Join(os.TempDir(), "snishaper-update")
-	stage := filepath.Join(base, "stage")
-	os.RemoveAll(stage)
-	if err := os.MkdirAll(stage, 0755); err != nil {
-		return err
-	}
-	script := filepath.Join(base, "apply-update.ps1")
-	content := buildUpdateScript(localPath, stage, execDir, base)
-	bom := append([]byte{0xEF, 0xBB, 0xBF}, []byte(content)...)
-	if err := os.WriteFile(script, bom, 0644); err != nil {
-		return err
-	}
-	// 用 cmd /c start 启动：让 pwsh 拥有独立的新控制台窗口
-	// （直接 exec 启动会继承 GUI 父进程的无效 std 句柄，新窗口收不到输出）
-	launcher := exec.Command("cmd", "/c", "start", "SniShaper 更新", "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script)
-	launcher.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
-	if err := launcher.Start(); err != nil {
-		return fmt.Errorf("failed to launch updater script: %v", err)
-	}
-	go func() {
-		_ = launcher.Wait()
-	}()
-	a.appendLog("[update] 7z update script launched (pwsh, visible window)")
-	return nil
-}
-
-func buildUpdateScript(archive, stage, execDir, base string) string {
-	return `$ErrorActionPreference = 'Continue'
-$Host.UI.RawUI.WindowTitle = 'SniShaper 便携版更新'
-Write-Host ''
-Write-Host '========================================' -ForegroundColor Cyan
-Write-Host '          SniShaper 便携版更新' -ForegroundColor Cyan
-Write-Host '========================================' -ForegroundColor Cyan
-Write-Host ''
-
-$archive = '` + archive + `'
-$stage = '` + stage + `'
-$execDir = '` + execDir + `'
-$base = '` + base + `'
-$exe = Join-Path $execDir 'snishaper.exe'
-
-Write-Host '[1/5] 正在解压更新包...' -ForegroundColor Yellow
-& tar -xf $archive -C $stage | Out-Null
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $stage 'snishaper.exe'))) {
-    Write-Host '[错误] 解压更新包失败。' -ForegroundColor Red
-    Read-Host '按回车键退出'
-    exit 1
-}
-Write-Host '      解压完成。' -ForegroundColor Green
-
-Write-Host '[2/5] 正在停止旧进程...' -ForegroundColor Yellow
-Stop-Process -Name 'snishaper' -Force -ErrorAction SilentlyContinue
-for ($i = 0; $i -lt 30; $i++) {
-    if (-not (Get-Process -Name 'snishaper' -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 500
-}
-Write-Host '      旧进程已退出。' -ForegroundColor Green
-
-Write-Host '[3/5] 正在覆盖程序文件...' -ForegroundColor Yellow
-$ok = $false
-for ($i = 0; $i -lt 10; $i++) {
-    try {
-        Copy-Item -Path (Join-Path $stage 'snishaper.exe') -Destination $exe -Force -ErrorAction Stop
-        $ok = $true
-        break
-    } catch { Start-Sleep -Seconds 1 }
-}
-if (-not $ok) {
-    Write-Host '[错误] 覆盖主程序失败，文件可能仍被占用。' -ForegroundColor Red
-    Read-Host '按回车键退出'
-    exit 2
-}
-Copy-Item -Path (Join-Path $stage 'rules') -Destination $execDir -Recurse -Force
-Write-Host '      文件已更新（保留个人设置）。' -ForegroundColor Green
-
-Write-Host '[4/5] 正在启动新版本...' -ForegroundColor Yellow
-for ($i = 0; $i -lt 30; $i++) {
-    if (Get-Process -Name 'snishaper' -ErrorAction SilentlyContinue) { break }
-    Start-Process -FilePath $exe
-    Start-Sleep -Seconds 3
-}
-
-Write-Host '[5/5] 清理临时文件...' -ForegroundColor Yellow
-Start-Sleep -Seconds 1
-Remove-Item -Path $base -Recurse -Force -ErrorAction SilentlyContinue
-
-if (Get-Process -Name 'snishaper' -ErrorAction SilentlyContinue) {
-    Write-Host ''
-    Write-Host '更新完成，SniShaper 已重新启动。' -ForegroundColor Green
-    Start-Sleep -Seconds 2
-} else {
-    Write-Host ''
-    Write-Host '[警告] 未检测到程序进程，请手动打开 SniShaper。' -ForegroundColor Yellow
-    Read-Host '按回车键退出'
-    exit 3
-}
-`
 }
 
 func isDirWritable(dir string) bool {

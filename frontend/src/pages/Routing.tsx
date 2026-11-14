@@ -1,22 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Workflow,
-  ShieldCheck,
+  RefreshCcw,
+  Shield,
   Activity,
-  Share2,
-  RefreshCw,
+  Share,
   Power,
-  Zap
+  Bolt
 } from '../lib/icons';
 import {
   GetAutoRoutingConfig,
   UpdateAutoRoutingConfig,
   GetAutoRoutingStatus,
-  RefreshGFWList,
   EventsOn
 } from '../api/bindings';
 import { toast } from '../lib/toast';
-import { extractErrorMessage } from '../lib/utils';
 import { useTranslation } from '../i18n/I18nContext';
 import { Box, Typography, Button } from '@mui/material';
 import { alpha } from '@mui/material/styles';
@@ -31,12 +28,11 @@ interface FlowEntry {
 }
 
 const pulse = keyframes`0%,100%{opacity:1}50%{opacity:0.4}`;
-const spin = keyframes`from{transform:rotate(0deg)}to{transform:rotate(360deg)}`;
 
 const Routing: React.FC = () => {
   const { t } = useTranslation();
   const [flows, setFlows] = useState<FlowEntry[]>([]);
-  const [config, setConfig] = useState<any>({ mode: '', gfwlist_url: '' });
+  const [config, setConfig] = useState<any>({ mode: '' });
   const [status, setStatus] = useState<any>({ enabled: false, domain_count: 0 });
   useEffect(() => {
     const loadData = async () => {
@@ -82,25 +78,9 @@ const Routing: React.FC = () => {
     toast.success(t('routing.notifications.saved'), t('routing.notifications.saved_desc'));
   };
 
-  const [refreshing, setRefreshing] = useState(false);
-
-  const handleRefreshGFW = async () => {
-    setRefreshing(true);
-    try {
-      await RefreshGFWList();
-      const s = await GetAutoRoutingStatus();
-      setStatus(s);
-      toast.success(t('routing.notifications.updated'), t('routing.notifications.updated_desc', { count: s?.domain_count || 0 }));
-    } catch (e: any) {
-      toast.error(t('common.error'), extractErrorMessage(e));
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
   return (
-    <Box sx={{ pt: 4, pb: 6, width: '100%', display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: { xs: 'flex-start', sm: 'flex-end' }, gap: 2 }}>
+    <Box sx={{ flexGrow: 1, minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <Box sx={{ pt: 4, mb: 4, flexShrink: 0, display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: { xs: 'flex-start', sm: 'flex-end' }, gap: 2 }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Box sx={{ p: 1.25, borderRadius: 1.5, border: 1, color: 'primary.main', bgcolor: (theme) => alpha(theme.palette.primary.main, 0.1), borderColor: (theme) => alpha(theme.palette.primary.main, 0.1), display: 'flex' }}>
             <Activity size={20} />
@@ -109,6 +89,7 @@ const Routing: React.FC = () => {
         </Box>
       </Box>
 
+      <Box sx={{ flexGrow: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', width: '100%', pb: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
       <Box sx={{ bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2, overflow: 'hidden', display: 'flex', flexDirection: 'column', height: 340 }}>
         <Box sx={{ px: 3, py: 2, borderBottom: 1, borderColor: 'divider', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'text.secondary', fontWeight: 700, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
@@ -119,16 +100,16 @@ const Routing: React.FC = () => {
         <Box sx={{ flex: 1, overflowY: 'auto', p: 2, display: 'flex', flexWrap: 'wrap', alignContent: 'flex-start', gap: 1.5, position: 'relative' }}>
             {flows.length === 0 && (
                 <Box sx={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'text.secondary', opacity: 0.4 }}>
-                    <Share2 size={40} strokeWidth={1} />
+                    <Share size={40} strokeWidth={1} />
                     <Typography variant="caption" sx={{ mt: 1.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em' }}>{t('routing.waiting_traffic')}</Typography>
                 </Box>
             )}
             {flows.map((flow) => (
                 <Box
                     key={flow.id}
-                    sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.75, bgcolor: 'action.hover', border: 1, borderColor: 'divider', borderRadius: '999px', boxShadow: 1, minWidth: 0 }}
+                    sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.75, bgcolor: 'action.hover', border: 1, borderColor: 'divider', borderRadius: '999px', boxShadow: 1, minWidth: 0, flexGrow: 1, flexBasis: 200, maxWidth: '100%' }}
                 >
-                    <Typography variant="caption" sx={{ fontWeight: 700, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', py: 0.25, outline: '1px solid transparent' }} title={flow.domain}>
+                    <Typography variant="caption" sx={{ fontWeight: 700, maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', py: 0.25, outline: '1px solid transparent' }} title={flow.domain}>
                         {flow.domain}
                     </Typography>
                     <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: '0.625rem' }}>➔</Typography>
@@ -143,7 +124,7 @@ const Routing: React.FC = () => {
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr', xl: 'repeat(3, 1fr)' }, gap: 4 }}>
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 0.5 }}>
-                <Box sx={{ display: 'inline-flex', color: 'primary.main' }}><Workflow size={18} /></Box>
+                <Box sx={{ display: 'inline-flex', color: 'primary.main' }}><RefreshCcw size={18} /></Box>
                 <Typography variant="body2" sx={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'text.secondary' }}>{t('routing.strategy')}</Typography>
              </Box>
              <Box sx={{ bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2, p: 2, display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -152,7 +133,7 @@ const Routing: React.FC = () => {
                     <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'repeat(2, 1fr)', sm: 'repeat(4, 1fr)' }, gap: 1.5 }}>
                         {[
                             { id: '', label: t('routing.modes.off'), icon: Power, color: 'text.secondary' },
-                            { id: 'default', label: t('routing.modes.smart'), icon: Zap, color: 'success.main' }
+                            { id: 'default', label: t('routing.modes.smart'), icon: Bolt, color: 'success.main' }
                         ].map((opt) => {
                             const active = config.mode === opt.id;
                             return (
@@ -186,22 +167,6 @@ const Routing: React.FC = () => {
                             {status.enabled ? t('routing.preloaded', { count: status.domain_count }) : t('routing.inactive')}
                         </Typography>
                     </Box>
-                    <Button
-                        onClick={handleRefreshGFW}
-                        disabled={refreshing}
-                        variant="outlined"
-                        size="small"
-                        sx={{
-                            borderRadius: 2, fontSize: '0.625rem', fontWeight: 900, textTransform: 'uppercase',
-                            letterSpacing: '0.1em', bgcolor: 'action.hover', borderColor: 'divider', color: 'text.secondary',
-                            '&:hover': { bgcolor: 'primary.main', color: 'common.white', borderColor: 'primary.main' },
-                        }}
-                        startIcon={
-                            <Box sx={{ display: 'inline-flex', animation: refreshing ? `${spin} 1s linear infinite` : 'none' }}><RefreshCw size={12} /></Box>
-                        }
-                    >
-                        {refreshing ? t('ech_form.probing') : t('routing.update_list')}
-                    </Button>
                 </Box>
                 <Button
                     onClick={handleSave}
@@ -217,13 +182,13 @@ const Routing: React.FC = () => {
 
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 0.5 }}>
-                <Box sx={{ display: 'inline-flex', color: 'success.main' }}><ShieldCheck size={18} /></Box>
+                <Box sx={{ display: 'inline-flex', color: 'success.main' }}><Shield size={18} /></Box>
                 <Typography variant="body2" sx={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'text.secondary' }}>{t('routing.features')}</Typography>
              </Box>
              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                 {[
-                    { icon: Zap, title: t('routing.feature_smart'), color: 'success.main', desc: t('routing.feature_smart_desc') },
-                    { icon: Activity, title: t('routing.feature_priority'), color: 'secondary.main', desc: t('routing.feature_priority_desc') }
+                    { icon: Bolt, title: t('routing.feature_smart'), color: 'success.main', desc: t('routing.feature_smart_desc') },
+                    { icon: RefreshCcw, title: t('routing.feature_priority'), color: 'secondary.main', desc: t('routing.feature_priority_desc') }
                 ].map((item, i) => (
                     <Box key={i} sx={{ p: 2, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2, display: 'flex', gap: 2, transition: 'border-color 0.15s', '&:hover': { borderColor: (theme) => alpha(theme.palette.primary.main, 0.4) } }}>
                         <Box sx={{ flexShrink: 0, width: 40, height: 40, borderRadius: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: 'action.hover', color: item.color }}>
@@ -237,6 +202,7 @@ const Routing: React.FC = () => {
                 ))}
              </Box>
         </Box>
+      </Box>
       </Box>
     </Box>
   );

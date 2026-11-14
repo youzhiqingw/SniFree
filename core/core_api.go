@@ -5,17 +5,30 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
-	"snishaper/proxy"
+	"snishaper/common"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 const coreRPCAddr = "127.0.0.1:18933"
+
+const (
+	// coreRPCHandshakeTimeout bounds how long either side waits for the
+	// token announcement, so a rogue connection cannot hold a goroutine.
+	coreRPCHandshakeTimeout = 5 * time.Second
+	// maxRPCTokenLen caps the announced token length (one size byte is
+	// already the hard limit at 255; this is a sanity bound).
+	maxRPCTokenLen = 128
+)
 
 var coreRPCToken string
 
@@ -72,6 +85,10 @@ type SetModeArgs struct {
 	Mode string
 }
 
+type ActiveConnectionsReply struct {
+	Connections []proxy.ConnInfo
+}
+
 type LogsArgs struct {
 	Limit int
 }
@@ -81,8 +98,11 @@ func (s *coreService) Authenticate(args AuthArgs, reply *BoolReply) error {
 	return nil
 }
 
-func (s *coreService) Ping(_ EmptyArgs, reply *BoolReply) error {
-	reply.Value = true
+// Ping 要求 token 匹配：使"core 存活"判定按实例隔离——持有旧实例
+// token 的客户端（如正在退出的 --serve）不会把复用固定端口的新 core
+// 当成自己的 core，从而既不会误杀它，也不会因 ping 成功而永不退出。
+func (s *coreService) Ping(args AuthArgs, reply *BoolReply) error {
+	reply.Value = args.Token == coreRPCToken
 	return nil
 }
 
@@ -106,7 +126,12 @@ func (s *coreService) ReloadCertificate(_ EmptyArgs, _ *EmptyArgs) error {
 	return s.runtime.reloadCertificate()
 }
 
-func (s *coreService) Shutdown(_ EmptyArgs, _ *EmptyArgs) error {
+// Shutdown 要求 token：否则任何本地进程都能经固定 RPC 端口杀掉 core，
+// 且旧 --serve 退出流程会误杀刚接任固定端口的新 core。
+func (s *coreService) Shutdown(args AuthArgs, _ *EmptyArgs) error {
+	if args.Token != coreRPCToken {
+		return errors.New("shutdown rejected: invalid token")
+	}
 	if s.stop != nil {
 		s.stop()
 	}
@@ -147,6 +172,15 @@ func (s *coreService) StartTUN(_ EmptyArgs, _ *EmptyArgs) error {
 
 func (s *coreService) StopTUN(_ EmptyArgs, _ *EmptyArgs) error {
 	go func() {
+		// StopTUN 与 StartTUN 一样需要 recover：释放路径要动 Wintun 设备与
+		// gvisor 栈，两者都可能 panic，缺了保护会连带整个 core 子进程退出，
+		// 表现为 GUI 侧所有 RPC 一起断连。
+		defer func() {
+			if rec := recover(); rec != nil {
+				s.runtime.appendLog("[core] StopTUN panic: " + fmt.Sprint(rec))
+				s.runtime.appendLog(string(debug.Stack()))
+			}
+		}()
 		if err := s.runtime.stopTUN(); err != nil {
 			s.runtime.appendLog("[core] StopTUN failed: " + err.Error())
 		}
@@ -189,6 +223,16 @@ func (s *coreService) GetRouteEvents(_ EmptyArgs, reply *RouteEventsReply) error
 	return nil
 }
 
+// GetActiveConnections 透传连接跟踪快照（有界注册表，见 core 的
+// proxy.ActiveConnections）；供 GUI 的实时连接查看器轮询。
+func (s *coreService) GetActiveConnections(_ EmptyArgs, reply *ActiveConnectionsReply) error {
+	reply.Connections = s.runtime.proxyServer.ActiveConnections()
+	if reply.Connections == nil {
+		reply.Connections = []proxy.ConnInfo{}
+	}
+	return nil
+}
+
 func (s *coreService) SetProxyMode(args SetModeArgs, _ *EmptyArgs) error {
 	return s.runtime.proxyServer.SetMode(args.Mode)
 }
@@ -198,42 +242,64 @@ func (s *coreService) GetProxyMode(_ EmptyArgs, reply *StringReply) error {
 	return nil
 }
 
-func (s *coreService) SetSocks5Enabled(args BoolReply, _ *EmptyArgs) error {
-	s.runtime.proxyServer.SetSocks5Enabled(args.Value)
-	s.runtime.ruleManager.SetSocks5Enabled(args.Value)
-	return s.runtime.ruleManager.SaveConfig()
-}
-
-func (s *coreService) GetSocks5Enabled(_ EmptyArgs, reply *BoolReply) error {
-	reply.Value = s.runtime.proxyServer.IsSocks5Enabled()
-	return nil
-}
-
-func (s *coreService) GetSocks5Port(_ EmptyArgs, reply *StringReply) error {
-	reply.Value = s.runtime.ruleManager.GetSocks5Port()
-	return nil
-}
-
-func (s *coreService) SetSocks5Port(args StringReply, _ *EmptyArgs) error {
-	s.runtime.ruleManager.SetSocks5Port(args.Value)
-	s.runtime.proxyServer.SetSocks5Addr("127.0.0.1:" + args.Value)
-	return s.runtime.ruleManager.SaveConfig()
+// verifyHandshake reads the client's token announcement from a freshly
+// accepted connection and reports whether it matches this core instance.
+// It is called before ServeConn, so every RPC method — not just the ones
+// that carry AuthArgs — is unreachable for local processes that did not
+// read the token file. The core runs elevated, and the RPC port is fixed,
+// so without this check any local process could drive TUN up/down, stop
+// the proxy or wipe logs with admin rights.
+func verifyHandshake(conn net.Conn) bool {
+	_ = conn.SetReadDeadline(time.Now().Add(coreRPCHandshakeTimeout))
+	var size [1]byte
+	if _, err := io.ReadFull(conn, size[:]); err != nil {
+		return false
+	}
+	if size[0] == 0 || int(size[0]) > maxRPCTokenLen {
+		return false
+	}
+	buf := make([]byte, size[0])
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return false
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	return string(buf) == coreRPCToken
 }
 
 // RunCoreMain starts the core RPC server. Called from main when --core flag is present.
 func RunCoreMain() error {
+	// The core hosts the proxy, and its stderr goes nowhere when the desktop app
+	// spawned it, so a fatal error would be lost: write crash reports to a file.
+	if execPath, err := os.Executable(); err == nil {
+		if path := common.EnableCrashLog(filepath.Join(filepath.Dir(execPath), "log")); path != "" {
+			fmt.Println("[core] Crash report file: " + path)
+		}
+	}
+
 	runtime, err := newCoreRuntime()
 	if err != nil {
 		return err
 	}
 	defer runtime.shutdown()
 
-	// Write RPC token to file for client to read
-	tokenPath := fmt.Sprintf("%s\\core_rpc_token", runtime.execDir)
+	// Write RPC token to the per-user config dir for the client to read.
+	// Not next to the exe: the portable install keeps the exe in a
+	// user-writable directory, where a non-elevated process could read the
+	// token and then drive the elevated core.
+	tokenPath := filepath.Join(common.UserConfigDir(), "core_rpc_token")
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0755); err != nil {
+		return fmt.Errorf("failed to prepare RPC token dir: %w", err)
+	}
 	if err := os.WriteFile(tokenPath, []byte(coreRPCToken), 0600); err != nil {
 		return fmt.Errorf("failed to write RPC token: %w", err)
 	}
-	defer os.Remove(tokenPath)
+	defer func() {
+		// 仅当文件仍属于本实例时才删除：新实例可能已覆盖写入自己的
+		// token，退出时不得删掉别人的。
+		if data, err := os.ReadFile(tokenPath); err == nil && strings.TrimSpace(string(data)) == coreRPCToken {
+			_ = os.Remove(tokenPath)
+		}
+	}()
 
 	server := rpc.NewServer()
 	var (
@@ -278,6 +344,11 @@ func RunCoreMain() error {
 				}
 				_ = conn.Close()
 			}()
+			// Rejected handshakes are closed silently: logging per attempt
+			// would hand a local flooder a disk-fill vector.
+			if !verifyHandshake(conn) {
+				return
+			}
 			server.ServeConn(conn)
 		}(conn)
 	}

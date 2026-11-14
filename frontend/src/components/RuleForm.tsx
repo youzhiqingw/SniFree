@@ -1,19 +1,19 @@
 import React, { useState, useEffect, useContext } from 'react';
 import {
-  Zap,
+  Bolt,
   Globe,
   Monitor,
   ChevronDown,
   ChevronUp,
   Plus,
-  Trash2,
+  Delete,
   Lock,
   Settings,
   AlertCircle
 } from '../lib/icons';
 import { Box, Typography, TextField, Switch, IconButton, Button } from '@mui/material';
 import { alpha } from '@mui/material/styles';
-import { AddSiteGroup, UpdateSiteGroup, GetECHProfiles, GetNAT64Profiles } from '../api/bindings';
+import { AddSiteGroup, UpdateSiteGroup, GetECHProfiles, GetNAT64Profiles, GetIPPools } from '../api/bindings';
 import { useTranslation } from '../i18n/I18nContext';
 import { SettingsCtx } from '../App';
 import { toast } from '../lib/toast';
@@ -23,6 +23,23 @@ interface RuleFormProps {
   onSuccess: () => void;
   onCancel: () => void;
 }
+
+const FRAG_DEFAULTS = { num_records: 4, num_segments: 1, interval_ms: 50, mod_minor_ver: true, oob: false };
+
+const fragFromBackend = (raw: any) => {
+  const r = raw || {};
+  const records = Number(r.num_records ?? FRAG_DEFAULTS.num_records) || FRAG_DEFAULTS.num_records;
+  return {
+    num_records: records,
+    num_segments: Number(r.num_segments ?? FRAG_DEFAULTS.num_segments) || FRAG_DEFAULTS.num_segments,
+    interval_ms: Math.max(0, Number(r.interval_ms ?? FRAG_DEFAULTS.interval_ms) || 0),
+    mod_minor_ver: r.mod_minor_ver === undefined || r.mod_minor_ver === null
+      ? FRAG_DEFAULTS.mod_minor_ver
+      : Boolean(r.mod_minor_ver),
+    oob: Boolean(r.oob),
+    tcp_only: records === 1
+  };
+};
 
 const normalizeCertVerify = (value: any) => {
   const next = {
@@ -63,9 +80,9 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
   const ipv6Option = (id: string) => id === 'prefer_ipv6' || id === 'ipv6_only';
 
   const MODES = [
-    { id: 'mitm', label: 'MITM', icon: <Zap size={14} />, desc: t('rules.modes.mitm') },
+    { id: 'mitm', label: 'MITM', icon: <Bolt size={14} />, desc: t('rules.modes.mitm') },
     { id: 'tls-rf', label: t('rules.display.fragment'), icon: <Monitor size={14} />, desc: t('rules.modes.tls-rf') },
-    { id: 'quic', label: 'QUIC', icon: <Zap size={14} />, desc: t('rules.modes.quic') },
+    { id: 'quic', label: 'QUIC', icon: <Bolt size={14} />, desc: t('rules.modes.quic') },
     { id: 'transparent', label: t('rules.display.transparent'), icon: <Monitor size={14} />, desc: t('rules.modes.transparent') },
     { id: 'migration', label: t('rules.display.migration'), icon: <Globe size={14} />, desc: t('rules.modes.migration') }
   ];
@@ -94,6 +111,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
     mode: 'mitm',
     upstream: '',
     domains: [] as string[],
+    process: '',
     dns_mode: '',
     sni_fake: '',
     enabled: true,
@@ -101,6 +119,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
     ech_profile_id: '',
     ech_domain: '',
     use_cf_pool: false,
+    ip_pool: '',
     nat64_enabled: false,
     nat64_profile_id: '',
     cert_verify: {
@@ -115,12 +134,14 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [echProfiles, setEchProfiles] = useState<any[]>([]);
   const [nat64Profiles, setNat64Profiles] = useState<any[]>([]);
+  const [ipPools, setIPPools] = useState<any[]>([]);
 
   useEffect(() => {
     const loadProfiles = async () => {
-      const [ps, ns] = await Promise.all([GetECHProfiles(), GetNAT64Profiles()]);
+      const [ps, ns, pools] = await Promise.all([GetECHProfiles(), GetNAT64Profiles(), GetIPPools()]);
       setEchProfiles(ps || []);
       setNat64Profiles(ns || []);
+      setIPPools(Array.isArray(pools) ? pools : []);
     };
     loadProfiles();
 
@@ -132,7 +153,10 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
       data.cert_verify = normalizeCertVerify(data.cert_verify);
       data.nat64_enabled = Boolean(data.nat64_enabled);
       data.nat64_profile_id = String(data.nat64_profile_id || '');
+      data.ip_pool = String(data.ip_pool || '');
+      data.process = String(data.process || '');
       setFormData(data);
+      setFrag(fragFromBackend(data.frag));
     }
   }, [initialData]);
 
@@ -160,7 +184,8 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
       cert_verify: normalizeCertVerify(formData.cert_verify),
       upstream: String(formData.upstream || '').trim().toUpperCase() === 'DIRECT'
         ? ''
-        : String(formData.upstream || '').trim()
+        : String(formData.upstream || '').trim(),
+      frag: currentMode === 'tls-rf' ? buildFragPayload() : null
     };
     try {
       if (formData.id) {
@@ -193,6 +218,36 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
   const showCertVerify = ['mitm', 'quic', 'migration'].includes(currentMode);
   const showNat64Config = ['mitm', 'quic', 'tls-rf', 'transparent', 'migration'].includes(currentMode);
   const showCfPool = ['mitm', 'transparent', 'tls-rf', 'quic'].includes(currentMode);
+  const showFragment = currentMode === 'tls-rf';
+
+  const [frag, setFrag] = useState<any>(fragFromBackend(null));
+
+  const setFragField = (field: string, value: any) => {
+    setFrag((prev: any) => ({ ...prev, [field]: value }));
+  };
+  const toggleFragmentField = (field: 'tcp_only' | 'mod_minor_ver' | 'oob') => {
+    setFrag((prev: any) => {
+      const next = { ...prev };
+      if (field === 'tcp_only') {
+        next.tcp_only = !next.tcp_only;
+        next.num_records = next.tcp_only ? 1 : FRAG_DEFAULTS.num_records;
+        next.num_segments = next.tcp_only ? 4 : FRAG_DEFAULTS.num_segments;
+      } else {
+        next[field] = !next[field];
+      }
+      return next;
+    });
+  };
+  const resetFragment = () => setFrag(fragFromBackend(null));
+
+  const buildFragPayload = () => ({
+    num_records: Number(frag.num_records) || 4,
+    num_segments: Number(frag.num_segments) || 1,
+    interval_ms: Math.max(0, Number(frag.interval_ms) || 0),
+    mod_minor_ver: Boolean(frag.mod_minor_ver),
+    oob: Boolean(frag.oob),
+    oob_ex: false
+  });
 
   const splitListInput = (value: string) =>
     value
@@ -250,7 +305,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 3 }}>
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
           <Typography variant="caption" sx={{ ...sectionLabelSx, display: 'flex', alignItems: 'center', gap: 0.75 }}>
-            <Box component="span" sx={{ display: 'inline-flex', color: 'primary.main' }}><Zap size={10} /></Box>
+            <Box component="span" sx={{ display: 'inline-flex', color: 'primary.main' }}><Bolt size={10} /></Box>
             {t('rules.form.name')}
           </Typography>
           <TextField
@@ -273,7 +328,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
             size="small"
             value={formData.website}
             onChange={(e) => setFormData({ ...formData, website: e.target.value })}
-            placeholder="google"
+            placeholder={t('rules.form.website_placeholder')}
             sx={inputSx}
           />
         </Box>
@@ -331,7 +386,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
               <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, px: 1.25, py: 0.5, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: '999px', boxShadow: 1, transition: 'all 0.2s', '&:hover': { borderColor: 'error.main' } }}>
                 <Typography variant="caption" sx={{ fontSize: 11, fontWeight: 'bold' }}>{d}</Typography>
                 <IconButton type="button" size="small" onClick={() => handleRemoveDomain(i)} aria-label={t('rules.form.remove_domain')} sx={{ p: 0.25, color: 'text.secondary', '&:hover': { color: 'error.main' } }}>
-                  <Trash2 size={12} />
+                  <Delete size={12} />
                 </IconButton>
               </Box>
             ))
@@ -371,16 +426,30 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
               <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1 }}>
                 {DNS_OPTIONS.map((option) => {
                   const active = String(formData.dns_mode || '') === option.id;
-                  const disabled = !ipv6Available && ipv6Option(option.id);
+                  const needsIPv6 = ipv6Option(option.id);
+                  const warnIPv6 = needsIPv6 && !ipv6Available;
                   return (
-                    <Box key={option.id || 'default'} onClick={() => !disabled && setFormData({ ...formData, dns_mode: option.id })} sx={cardSx(active, { disabled })}>
+                    <Box key={option.id || 'default'} onClick={() => setFormData({ ...formData, dns_mode: option.id })} sx={cardSx(active, { warn: warnIPv6 })}>
                       <Typography variant="caption" sx={{ fontWeight: 900, letterSpacing: '0.05em' }}>{option.label}</Typography>
-                      <Typography variant="caption" sx={{ fontSize: 10, lineHeight: 1.6, opacity: 0.8 }}>{disabled ? t('network.ipv6_disabled_title') : option.desc}</Typography>
+                      <Typography variant="caption" sx={{ fontSize: 10, lineHeight: 1.6, opacity: 0.8 }}>{warnIPv6 ? t('network.ipv6_only_will_fail') : option.desc}</Typography>
                     </Box>
                   );
                 })}
               </Box>
             </Box>
+          </Box>
+
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+            <Typography variant="caption" sx={sectionLabelSx}>{t('rules.form.process')}</Typography>
+            <TextField
+              type="text"
+              size="small"
+              value={formData.process || ''}
+              onChange={(e) => setFormData({ ...formData, process: e.target.value })}
+              placeholder={t('rules.form.process_placeholder')}
+              sx={inputSx}
+            />
+            <Typography variant="caption" sx={{ fontSize: 10, color: 'text.secondary', lineHeight: 1.5 }}>{t('rules.form.process_hint')}</Typography>
           </Box>
 
           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 3 }}>
@@ -433,9 +502,9 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
                     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, maxHeight: 176, overflowY: 'auto', pr: 0.5 }}>
                       {nat64Profiles.map((p) => {
                         const active = formData.nat64_profile_id === p.id;
-                        const disabled = !ipv6Available;
+                        const warnIPv6 = !ipv6Available;
                         return (
-                          <Box key={p.id} onClick={() => ipv6Available && setFormData({ ...formData, nat64_profile_id: p.id })} sx={cardSx(active, { disabled })}>
+                          <Box key={p.id} onClick={() => setFormData({ ...formData, nat64_profile_id: p.id })} sx={cardSx(active, { warn: warnIPv6 })}>
                             <Typography variant="caption" sx={{ fontWeight: 900, letterSpacing: '0.05em' }}>{p.name}</Typography>
                             <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.8 }}>{t('rules.form.prefix_label', { prefix: p.prefix })}</Typography>
                           </Box>
@@ -469,15 +538,15 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
               </Box>
             )}
             {showNat64Config && (
-              <Box onClick={() => ipv6Available && toggleBooleanField('nat64_enabled')} sx={cardSx(formData.nat64_enabled, { row: true, inactiveBg: 'action.hover', disabled: !ipv6Available })}>
+              <Box onClick={() => toggleBooleanField('nat64_enabled')} sx={cardSx(formData.nat64_enabled, { row: true, inactiveBg: 'action.hover', warn: !ipv6Available })}>
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0 }}>
                   <Typography variant="caption" sx={{ fontWeight: 'bold', color: 'text.primary', display: 'flex', alignItems: 'center', gap: 0.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', py: 0.25 }}>
                     <Box component="span" sx={{ display: 'inline-flex', color: 'secondary.main' }}><Globe size={12} /></Box>
                     {t('rules.form.nat64_enable')}
                   </Typography>
-                  <Typography variant="caption" sx={{ fontSize: 10, color: 'text.secondary' }}>{!ipv6Available ? t('network.ipv6_disabled_title') : t('rules.form.nat64_hint')}</Typography>
+                  <Typography variant="caption" sx={{ fontSize: 10, color: 'text.secondary' }}>{!ipv6Available ? t('network.ipv6_nat64_will_fail') : t('rules.form.nat64_hint')}</Typography>
                 </Box>
-                <Switch size="small" checked={Boolean(formData.nat64_enabled)} disabled={!ipv6Available} />
+                <Switch size="small" checked={Boolean(formData.nat64_enabled)} />
               </Box>
             )}
             {showCfPool && (
@@ -490,6 +559,104 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
               </Box>
             )}
           </Box>
+
+          {showCfPool && ipPools.length > 0 && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, p: 2, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'text.secondary', px: 1 }}>
+                {t('rules.form.ip_pool_select')}
+              </Typography>
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1 }}>
+                {ipPools.map((pool: any) => {
+                  const active = formData.ip_pool === pool.name;
+                  return (
+                    <Box
+                      key={pool.name}
+                      onClick={() => setFormData({ ...formData, ip_pool: active ? '' : pool.name })}
+                      sx={cardSx(active, { row: true, inactiveBg: 'action.hover' })}
+                    >
+                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0 }}>
+                        <Typography variant="caption" sx={{ fontWeight: 'bold', color: 'text.primary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', py: 0.25 }}>
+                          <Box component="span" sx={{ display: 'inline-flex', mr: 0.5, color: 'primary.main' }}><Globe size={12} /></Box>
+                          {pool.name}
+                        </Typography>
+                        <Typography variant="caption" sx={{ fontSize: 10, color: 'text.secondary' }}>
+                          {t('rules.form.ip_pool_count', { count: (pool.preferred_ips || []).length })}
+                        </Typography>
+                      </Box>
+                      <Switch size="small" checked={active} />
+                    </Box>
+                  );
+                })}
+              </Box>
+            </Box>
+          )}
+
+          {showFragment && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, p: 2, border: 1, borderColor: 'divider', bgcolor: 'background.paper', borderRadius: 2 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'primary.main' }}>
+                <Monitor size={16} />
+                <Typography variant="caption" sx={{ fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  {t('rules.fragment.title')}
+                </Typography>
+                <Box sx={{ flex: 1 }} />
+                <Button size="small" onClick={resetFragment} sx={{ fontSize: 10 }}>
+                  {t('rules.fragment.reset')}
+                </Button>
+              </Box>
+
+              <Box onClick={() => toggleFragmentField('tcp_only')} sx={cardSx(frag.tcp_only, { row: true, inactiveBg: 'action.hover' })}>
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 'bold', color: 'text.primary', display: 'flex', alignItems: 'center', gap: 0.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', py: 0.25 }}>
+                    <Box component="span" sx={{ display: 'inline-flex', color: 'primary.main' }}><Bolt size={12} /></Box>
+                    {t('rules.fragment.tcp_only')}
+                  </Typography>
+                </Box>
+                <Switch size="small" checked={frag.tcp_only} />
+              </Box>
+
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.5 }}>
+                <TextField
+                  size="small" fullWidth type="number"
+                  slotProps={{ htmlInput: { min: 1, max: 8 } }}
+                  label={t('rules.fragment.records')}
+                  value={frag.num_records}
+                  onChange={(e) => setFragField('num_records', Number(e.target.value))}
+                />
+                <TextField
+                  size="small" fullWidth type="number"
+                  slotProps={{ htmlInput: { min: 1, max: 16 } }}
+                  label={t('rules.fragment.segments')}
+                  value={frag.num_segments}
+                  onChange={(e) => setFragField('num_segments', Number(e.target.value))}
+                />
+                <TextField
+                  size="small" fullWidth type="number"
+                  slotProps={{ htmlInput: { min: 0, max: 500 } }}
+                  label={t('rules.fragment.interval')}
+                  value={frag.interval_ms}
+                  onChange={(e) => setFragField('interval_ms', Number(e.target.value))}
+                />
+              </Box>
+
+              <Box onClick={() => toggleFragmentField('mod_minor_ver')} sx={cardSx(frag.mod_minor_ver, { row: true, inactiveBg: 'action.hover' })}>
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 'bold', color: 'text.primary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', py: 0.25 }}>
+                    {t('rules.fragment.minorver')}
+                  </Typography>
+                </Box>
+                <Switch size="small" checked={frag.mod_minor_ver} />
+              </Box>
+
+              <Box onClick={() => toggleFragmentField('oob')} sx={cardSx(frag.oob, { row: true, inactiveBg: 'action.hover' })}>
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 'bold', color: 'text.primary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%', py: 0.25 }}>
+                    {t('rules.fragment.oob')}
+                  </Typography>
+                </Box>
+                <Switch size="small" checked={frag.oob} />
+              </Box>
+            </Box>
+          )}
 
           {showCertVerify && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, p: 2, border: 1, borderColor: 'warning.main', bgcolor: 'background.paper', borderRadius: 2, position: 'relative' }}>
@@ -560,7 +727,7 @@ const RuleForm: React.FC<RuleFormProps> = ({ initialData, onSuccess, onCancel })
                     value={joinListInput(formData.cert_verify.spki_sha256)}
                     onChange={(e) => setCertVerify({ spki_sha256: splitListInput(e.target.value) })}
                     placeholder={t('rules.form.placeholder_spki')}
-                    sx={{ ...inputSx, '& textarea': { fontSize: '0.75rem', lineHeight: 1.6, resize: 'none', fontFamily: 'monospace' } }}
+                    sx={{ ...inputSx, '& textarea': { fontSize: '0.75rem', lineHeight: 1.6, resize: 'none', } }}
                   />
                 </Box>
               )}

@@ -5,11 +5,16 @@ build/bin/
 *.dll
 *.msi
 *.syso
-!snishaper.syso
+
+# Wails v3 task runner checksum cache
+.task/
 
 # Go cache / temp
 .gocache/
 *.test
+
+# Rules remote sync state (written next to the live rules file)
+rules_remote_sync.json
 
 # Frontend deps and build artifacts
 node_modules/
@@ -48,6 +53,7 @@ pkg/certmanager/*.pem
 
 # Local temp / backups
 temp/
+.freebuff/
 *.bak
 *.bak.*
 rules/*.bak*
@@ -70,6 +76,7 @@ shaper-next/
 snishaper.zip
 Apppackage/
 blindtls-vercel/
+llm/
 
 # Custom ignores - added for mitmverify and cmd
 mitmverify.exe
@@ -97,10 +104,19 @@ build/bin/markers/
 /.workbuddy/
 
 .history/
-docs/
 .opencode/
 
 AGENTS.md
 
 # Development certificate
 devcert.pfx
+
+# refactor backups
+reference/
+
+# IP scanner logs
+tools/logs/*
+!tools/logs/.gitkeep
+/.vs
+/.v2c/
+/spec/

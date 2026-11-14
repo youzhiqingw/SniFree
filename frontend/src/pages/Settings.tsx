@@ -1,29 +1,35 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   ShieldAlert, Download, FolderOpen, RefreshCcw, Monitor, Anchor,
-  Cpu, Globe, BellRing, Activity, CloudLightning, Zap, Trash2,
-  AlertCircle, Sun, Moon, Wifi, FileText, Settings as SettingsIcon
+  Cpu, Globe, BellRing, Activity, Bolt, Delete,
+  AlertCircle, Sun, Moon, Wifi, FileText, Settings as SettingsIcon,
 } from '../lib/icons';
 import {
   GetListenPort, SetListenPort, GetCloseToTray, SetCloseToTray,
   GetAutoStart, SetAutoStart, GetShowMainWindowOnAutoStart, SetShowMainWindowOnAutoStart,
   GetAutoEnableProxyOnAutoStart, SetAutoEnableProxyOnAutoStart,
-  GetSocks5Port, SetSocks5Port, GetTUNConfig, UpdateTUNConfig, GetTUNStatus,
+  GetAutoEnableSysProxyOnAutoStart, SetAutoEnableSysProxyOnAutoStart,
+  GetAutoUpdateRules, SetAutoUpdateRules,
+  GetTUNConfig, UpdateTUNConfig, GetTUNStatus,
   OpenCertDir, RegenerateCert, GetCAInstallStatus, GetInstalledCerts,
   UninstallCert, ExportConfig, ImportConfigWithSummary,
   GetCloudflareConfig, UpdateCloudflareConfig, GetCloudflareIPStats,
   ForceFetchCloudflareIPs, TriggerCFHealthCheck, RemoveInvalidCFIPs,
+  GetIPPools, UpdateIPPools,
   GetLanguage, SetLanguage,
   GetIPv6Available, RefreshIPv6Check,
   GetLogFiles, OpenLogFile, CleanOldLogs,
   GetUpdateChannel, SetUpdateChannel,
   GetDownloadSource, SetDownloadSource,
   GetCustomDownloadSource, SetCustomDownloadSource,
-  MeasureDownloadSources
+  MeasureDownloadSources,
+  GetNetworkInterfaces, SetTUNInterface, SetTUNInterfaceExclude,
+  SetAppearanceMode,
 } from '../api/bindings';
 import {
   Box, Button, TextField, Select, MenuItem, FormControl, InputLabel, Switch,
   FormControlLabel, Tooltip, Typography, Stack, Grid, Badge, Divider, CircularProgress,
+  Autocomplete, Chip,
 } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import { toast } from '../lib/toast';
@@ -68,8 +74,8 @@ const SettingRowInline = ({ icon, title, desc, children }: { icon: React.ReactNo
   </Box>
 );
 
-const StackedRow = ({ icon, title, desc, children }: { icon: React.ReactNode; title: string; desc?: string; children: React.ReactNode }) => (
-  <Box sx={{ p: 2.5, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2 }}>
+const StackedRow = ({ icon, title, desc, children, ...rest }: { icon: React.ReactNode; title: string; desc?: string; children: React.ReactNode } & React.ComponentProps<typeof Box>) => (
+  <Box {...rest} sx={{ p: 2.5, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2 }}>
     <Stack direction="row" spacing={1.5} sx={{ mb: desc ? 1.5 : 0, alignItems: 'center' }}>
       <Box sx={{ width: 40, height: 40, borderRadius: 1, bgcolor: 'primary.main', color: 'primary.contrastText', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
         {icon}
@@ -84,13 +90,14 @@ const StackedRow = ({ icon, title, desc, children }: { icon: React.ReactNode; ti
 );
 
 const UPDATE_CHANNELS = [
-  { value: 'alpha', label: 'Alpha' },
-  { value: 'beta', label: 'Beta' },
-  { value: 'rc', label: 'Release Candidate' },
-  { value: 'stable', label: 'Stable' },
+  { value: 'alpha', labelKey: 'about.channel_alpha' },
+  { value: 'beta', labelKey: 'about.channel_beta' },
+  { value: 'rc', labelKey: 'about.channel_rc' },
+  { value: 'stable', labelKey: 'about.channel_stable' },
 ];
 
 const DOWNLOAD_SOURCES = [
+  { value: 'smart', labelKey: 'settings.download_source.smart' },
   { value: 'direct', labelKey: 'settings.download_source.direct' },
   { value: 'down.mxw.qzz.io', label: 'down.mxw.qzz.io' },
   { value: 'gh-proxy.org', label: 'gh-proxy.org' },
@@ -105,11 +112,12 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
   const { t, language, setLanguage: setI18nLanguage } = useTranslation();
   const { mode, setMode } = useColorScheme();
   const [port, setPort] = useState(String(cache.port ?? ''));
-  const [socks5Port, setSocks5Port] = useState(String(cache.socks5Port ?? '8081'));
   const [closeToTray, setCloseToTray] = useState(cache.closeToTray);
   const [autoStart, setAutoStart] = useState(cache.autoStart);
   const [showMainOnAutoStart, setShowMainOnAutoStart] = useState(cache.showMainOnAutoStart);
   const [autoEnableProxyOnAutoStart, setAutoEnableProxyOnAutoStart] = useState(cache.autoEnableProxyOnAutoStart);
+  const [autoEnableSysProxyOnAutoStart, setAutoEnableSysProxyOnAutoStart] = useState(cache.autoEnableSysProxyOnAutoStart);
+  const [autoUpdateRules, setAutoUpdateRules] = useState(cache.autoUpdateRules !== false);
   const [cfConfig, setCfConfig] = useState<any>(cache.cfConfig);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
@@ -119,6 +127,9 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
   const caStatus = cache.caStatus;
   const installedCerts = cache.installedCerts || [];
   const [ipStats, setIpStats] = useState<any[]>(cache.ipStats || []);
+  const [ipPools, setIpPools] = useState<any[]>(cache.ipPools || []);
+  const [newPoolName, setNewPoolName] = useState('');
+  const [newPoolIPs, setNewPoolIPs] = useState('');
   const [isIpv6Checking, setIsIpv6Checking] = useState(false);
   const ipv6Available = cache.ipv6Available !== false;
   const [updateChannel, setUpdateChannel] = useState<string>(cache.updateChannel || 'stable');
@@ -126,6 +137,78 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
   const [customSource, setCustomSource] = useState<string>(cache.customDownloadSource || '');
   const [sourceResults, setSourceResults] = useState<any[]>([]);
   const [measuring, setMeasuring] = useState<boolean>(false);
+  const [ifaces, setIfaces] = useState<any[]>([]);
+  const [outboundIface, setOutboundIface] = useState<string>('');
+  const [outboundExclude, setOutboundExclude] = useState<string[]>([]);
+  const [outboundExcludeInput, setOutboundExcludeInput] = useState<string>('');
+  const [tunStack, setTunStack] = useState<string>('gvisor');
+  const [adapterName, setAdapterName] = useState<string>('');
+  const [routeExclude, setRouteExclude] = useState<string>('');
+
+  const loadIfaces = useCallback(async () => {
+    try {
+      const [list, cfg] = await Promise.all([GetNetworkInterfaces(), GetTUNConfig()]);
+      setIfaces(Array.isArray(list) ? list : []);
+      const pick = (obj: any, snake: string, pascal: string) => obj?.[snake] ?? obj?.[pascal] ?? '';
+      setOutboundIface(String(pick(cfg, 'interface_name', 'InterfaceName') || ''));
+
+      setTunStack(String(pick(cfg, 'stack', 'Stack') || 'gvisor'));
+      setAdapterName(String(pick(cfg, 'adapter_name', 'AdapterName') || ''));
+
+      setOutboundExclude(
+        Array.isArray(cfg?.exclude_interface)
+          ? cfg.exclude_interface
+          : Array.isArray(cfg?.ExcludeInterfaces)
+            ? cfg.ExcludeInterfaces
+            : []
+      );
+      setOutboundExcludeInput('');
+
+      setRouteExclude(Array.isArray(cfg?.route_exclude_address)
+        ? cfg.route_exclude_address.join(',')
+        : Array.isArray(cfg?.RouteExcludeAddresses)
+          ? cfg.RouteExcludeAddresses.join(',')
+          : '');
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    loadIfaces();
+  }, [loadIfaces]);
+
+  const saveTUNField = useCallback(async (patch: any, successKey?: string) => {
+    try {
+      const cfg = await GetTUNConfig();
+      const merged = { ...(cfg || {}), ...patch };
+      await UpdateTUNConfig(merged);
+      if (successKey) toast.success(t(successKey));
+      await loadIfaces();
+    } catch (err: any) {
+      toast.error(t('common.failed'), String(err));
+    }
+  }, [loadIfaces]);
+  
+  // MUI 在 Select 菜单关闭后会把焦点交还给触发按钮，导致 InputLabel 一直保持
+  // shrink（收缩上移）状态，必须再点一下别处才复位。这里在 onClose 时主动失焦。
+  const blurSelectAfterClose = useCallback(() => {
+    window.setTimeout(() => {
+      const el = document.activeElement;
+      if (el instanceof HTMLElement) el.blur();
+    }, 0);
+  }, []);
+
+  const saveExclude = useCallback(async (values: string[]) => {
+    try {
+      // The backend expects a comma-separated string, so join the array before sending.
+      const excludeStr = values.join(',');
+      await SetTUNInterfaceExclude(excludeStr);
+      toast.success(t('settings.notifications.updated'));
+    } catch (err: any) {
+      toast.error(t('common.failed'), String(err));
+    }
+  }, []);
 
   const measureSources = async () => {
     if (measuring) return;
@@ -137,6 +220,53 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
       toast.error(t('common.failed'), String(err));
     } finally {
       setMeasuring(false);
+    }
+  };
+
+  const reloadIPPools = useCallback(async () => {
+    try {
+      const pools = await GetIPPools();
+      const list = Array.isArray(pools) ? pools : [];
+      setIpPools(list);
+      onCacheUpdate({ ipPools: list });
+    } catch {
+      /* ignore */
+    }
+  }, [onCacheUpdate]);
+
+  const handleAddPool = async () => {
+    const name = newPoolName.trim().toLowerCase();
+    const ips = newPoolIPs.split(/[\s,;]+/).map((s: string) => s.trim()).filter(Boolean);
+    if (!name || name === 'cloudflare') {
+      toast.error(t('common.failed'), t('settings.ip_pools.invalid_name'));
+      return;
+    }
+    if (ips.length === 0) {
+      toast.error(t('common.failed'), t('settings.ip_pools.no_ips'));
+      return;
+    }
+    if (ipPools.some((p: any) => p.name === name)) {
+      toast.error(t('common.failed'), t('settings.ip_pools.duplicate_name'));
+      return;
+    }
+    try {
+      await UpdateIPPools([...ipPools, { name, preferred_ips: ips, auto_update: false, api_key: '' }]);
+      setNewPoolName('');
+      setNewPoolIPs('');
+      toast.success(t('settings.ip_pools.added', { name }));
+      await reloadIPPools();
+    } catch (err: any) {
+      toast.error(t('common.failed'), String(err));
+    }
+  };
+
+  const handleRemovePool = async (name: string) => {
+    try {
+      await UpdateIPPools(ipPools.filter((p: any) => p.name !== name));
+      toast.success(t('settings.ip_pools.removed', { name }));
+      await reloadIPPools();
+    } catch (err: any) {
+      toast.error(t('common.failed'), String(err));
     }
   };
 
@@ -160,6 +290,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
 
   useEffect(() => {
     reloadCriticalData();
+    reloadIPPools();
     TriggerCFHealthCheck().catch(console.error);
     GetUpdateChannel().then((c) => {
       if (c) {
@@ -233,23 +364,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
     }
     await SetListenPort(parsed);
     onCacheUpdate({ port: parsed });
-    toast.success(t('settings.notifications.updated'), `${t('settings.http_port')} ${parsed}`);
-  };
-
-  const handleSaveSocks5Port = async (val: string) => {
-    const normalized = val.trim();
-    const parsed = parseInt(normalized, 10);
-    if (!normalized || Number.isNaN(parsed) || parsed < 1 || parsed > 65535) {
-      setSocks5Port(String(cache.socks5Port ?? '8081'));
-      toast.error(t('common.failed'), t('settings.notifications.port_invalid'));
-      return;
-    }
-    setSocks5Port(normalized);
-    try {
-      await SetSocks5Port(normalized);
-      onCacheUpdate({ socks5Port: normalized });
-      toast.success(t('settings.notifications.updated'));
-    } catch (err: any) { toast.error(t('common.failed'), String(err)); }
+    toast.success(t('settings.notifications.updated'), `${t('settings.port_label')} ${parsed}`);
   };
 
   const handleToggleTray = async (val: boolean) => {
@@ -275,6 +390,24 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
       onCacheUpdate({ autoEnableProxyOnAutoStart: val });
       toast.success(t('settings.notifications.updated'));
     } catch (err: any) { setAutoEnableProxyOnAutoStart(!val); toast.error(t('common.failed'), String(err)); }
+  };
+
+  const handleToggleAutoEnableSysProxyOnAutoStart = async (val: boolean) => {
+    setAutoEnableSysProxyOnAutoStart(val);
+    try {
+      await SetAutoEnableSysProxyOnAutoStart(val);
+      onCacheUpdate({ autoEnableSysProxyOnAutoStart: val });
+      toast.success(t('settings.notifications.updated'));
+    } catch (err: any) { setAutoEnableSysProxyOnAutoStart(!val); toast.error(t('common.failed'), String(err)); }
+  };
+
+  const handleToggleAutoUpdateRules = async (val: boolean) => {
+    setAutoUpdateRules(val);
+    try {
+      await SetAutoUpdateRules(val);
+      onCacheUpdate({ autoUpdateRules: val });
+      toast.success(t('settings.notifications.updated'));
+    } catch (err: any) { setAutoUpdateRules(!val); toast.error(t('common.failed'), String(err)); }
   };
 
   const handleToggleShowMainWindowOnAutoStart = async (val: boolean) => {
@@ -308,7 +441,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
     try {
       const available = await RefreshIPv6Check();
       onCacheUpdate({ ipv6Available: available === true });
-      toast[available ? 'success' : 'error'](available ? t('network.ipv6_ok') : t('network.ipv6_disabled_title'), t('network.ipv6_ok_desc'));
+      toast[available ? 'success' : 'error'](available ? t('network.ipv6_ok') : t('network.ipv6_disabled_title'), available ? t('network.ipv6_ok_desc') : t('network.ipv6_disabled_desc'));
     } catch (err: any) { toast.error(t('common.failed'), String(err));
     } finally { setIsIpv6Checking(false); }
   };
@@ -380,9 +513,29 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
   const channelKey = 'settings.update_channel.' + updateChannel;
   const channelDesc = t(channelKey) === channelKey ? t('settings.update_channel.stable') : t(channelKey);
 
+  // Render a single network interface option; shared by the outbound iface and exclude iface lists.
+  const renderInterfaceOption = (nic: any) => (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+      <span>{nic.name}</span>
+      <Typography variant="caption" color={nic.physical ? 'success.main' : 'text.secondary'}>
+        {nic.physical ? t('settings.tun.outbound_iface.physical') : t('settings.tun.outbound_iface.virtual')}
+      </Typography>
+      {nic.default_route && (
+        <Typography variant="caption" color="primary.main">
+          {t('settings.tun.outbound_iface.default_route')}
+        </Typography>
+      )}
+      {nic.current_outbound && (
+        <Typography variant="caption" color="warning.main">
+          {t('settings.tun.outbound_iface.in_use')}
+        </Typography>
+      )}
+    </Box>
+  );
+
   return (
-    <Box sx={{ pt: 4, pb: 6, width: '100%', display: 'flex', flexDirection: 'column' }}>
-      <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: { xs: 'flex-start', sm: 'flex-end' }, gap: 2, mb: 6 }}>
+    <Box sx={{ flexGrow: 1, minHeight: 0, width: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <Box sx={{ pt: 4, flexShrink: 0, display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: { xs: 'flex-start', sm: 'flex-end' }, gap: 2, mb: 6 }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
           <Box sx={{ p: 1.25, borderRadius: 1.5, border: 1, color: 'primary.main', bgcolor: (theme) => alpha(theme.palette.primary.main, 0.1), borderColor: (theme) => alpha(theme.palette.primary.main, 0.1), display: 'flex' }}>
             <SettingsIcon size={20} />
@@ -393,42 +546,26 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
         </Box>
       </Box>
 
+      <Box sx={{ flexGrow: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', width: '100%', pb: 6 }}>
       <Grid container spacing={3}>
         <Grid size={{ xs: 12, lg: 6 }}>
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
             <SectionHeader icon={<Anchor size={18} />} label={t('settings.tabs.general')} />
 
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-              <SettingRowInline icon={<Monitor size={18} />} title={t('settings.port_title')}>
-                <Stack direction="row" spacing={1.5} sx={{ alignItems: 'flex-start' }}>
-                  <Stack direction="row" spacing={1} sx={{ alignItems: 'flex-start' }}>
-                    <TextField
-                      label={t('settings.http_port')}
-                      type="text"
-                      size="small"
-                      value={port}
-                      onChange={(e) => setPort(e.target.value.replace(/\D/g, '').slice(0, 5))}
-                      sx={{ width: 88, '& input': { fontSize: '0.875rem', textAlign: 'center' } }}
-                    />
-                    <Button size="small" variant="contained" color="primary" onClick={handleSavePort}>
-                      {t('common.apply')}
-                    </Button>
-                  </Stack>
-                  <Stack direction="row" spacing={1} sx={{ alignItems: 'flex-start' }}>
-                    <TextField
-                      label={t('settings.socks_port')}
-                      type="text"
-                      size="small"
-                      value={socks5Port}
-                      onChange={(e) => setSocks5Port(e.target.value.replace(/\D/g, '').slice(0, 5))}
-                      onBlur={(e) => handleSaveSocks5Port(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-                      sx={{ width: 88, '& input': { fontSize: '0.875rem', textAlign: 'center' } }}
-                    />
-                    <Button size="small" variant="contained" color="primary" onClick={() => handleSaveSocks5Port(socks5Port)}>
-                      {t('common.apply')}
-                    </Button>
-                  </Stack>
+              <SettingRowInline icon={<Monitor size={18} />} title={t('settings.port_title')} desc={t('settings.port_desc')}>
+                <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center' }}>
+                  <TextField
+                    label={t('settings.port_label')}
+                    type="text"
+                    size="small"
+                    value={port}
+                    onChange={(e) => setPort(e.target.value.replace(/\D/g, '').slice(0, 5))}
+                    sx={{ width: 120, '& input': { fontSize: '0.875rem', textAlign: 'center' } }}
+                  />
+                  <Button size="small" variant="contained" color="primary" onClick={handleSavePort}>
+                    {t('common.apply')}
+                  </Button>
                 </Stack>
               </SettingRowInline>
 
@@ -442,8 +579,14 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                 />
               </SettingRowInline>
 
+              <SettingRowInline title={t('settings.tutorial.title')} desc={t('settings.tutorial.desc')} icon={<RefreshCcw size={18} />}>
+                <Button size="small" variant="outlined" color="primary" onClick={() => window.dispatchEvent(new CustomEvent('app:restart-tutorial'))}>
+                  {t('settings.tutorial.replay')}
+                </Button>
+              </SettingRowInline>
+
               <SettingRowInline title={t('settings.language.title')} desc={t('settings.language.desc')} icon={<Globe size={18} />}>
-                <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', bgcolor: bgColor, border: 1, borderColor: 'divider', borderRadius: 2, p: 0.5 }} role="radiogroup" aria-label="选择语言">
+                <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', bgcolor: bgColor, border: 1, borderColor: 'divider', borderRadius: 2, p: 0.5 }} role="radiogroup" aria-label={t('settings.select_language')}>
                   {(['zh', 'en', 'ru'] as const).map((lang) => (
                     <Box
                       key={lang}
@@ -491,7 +634,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                       bgcolor: mode === 'light' ? 'primary.main' : 'transparent',
                       '&:hover': { color: 'text.primary' },
                     }}
-                    onClick={() => mode === 'dark' && setMode('light')}
+                    onClick={() => { setMode('light'); SetAppearanceMode('light').catch(() => {}); }}
                     role="radio"
                     aria-checked={mode === 'light'}
                   >
@@ -516,12 +659,37 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                       bgcolor: mode === 'dark' ? 'primary.main' : 'transparent',
                       '&:hover': { color: 'text.primary' },
                     }}
-                    onClick={() => mode === 'light' && setMode('dark')}
+                    onClick={() => { setMode('dark'); SetAppearanceMode('dark').catch(() => {}); }}
                     role="radio"
                     aria-checked={mode === 'dark'}
                   >
                     <Moon size={14} />
                     {t('settings.appearance.dark')}
+                  </Box>
+                  <Box
+                    component="button"
+                    type="button"
+                    sx={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 0.25,
+                      px: 1.5,
+                      py: 0.75,
+                      fontSize: '0.75rem',
+                      fontWeight: 'bold',
+                      borderRadius: 1,
+                      border: 'none',
+                      cursor: 'pointer',
+                      color: mode === 'system' ? '#fff' : 'text.secondary',
+                      bgcolor: mode === 'system' ? 'primary.main' : 'transparent',
+                      '&:hover': { color: 'text.primary' },
+                    }}
+                    onClick={() => { setMode('system'); SetAppearanceMode('system').catch(() => {}); }}
+                    role="radio"
+                    aria-checked={mode === 'system'}
+                  >
+                    <Monitor size={14} />
+                    {t('settings.appearance.system')}
                   </Box>
                 </Stack>
               </SettingRowInline>
@@ -558,11 +726,14 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                       label={t('settings.update_channel.title')}
                       onChange={(e) => handleChannelChange(e.target.value)}
                     >
-                      {UPDATE_CHANNELS.map((ch) => (
-                        <MenuItem key={ch.value} value={ch.value}>
-                          {ch.label}
-                        </MenuItem>
-                      ))}
+                      {UPDATE_CHANNELS.map((ch) => {
+                        const translated = t(ch.labelKey);
+                        return (
+                          <MenuItem key={ch.value} value={ch.value}>
+                            {translated !== ch.labelKey ? translated : ch.value}
+                          </MenuItem>
+                        );
+                      })}
                     </Select>
                   </FormControl>
                 </Box>
@@ -628,6 +799,206 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                   )}
                 </Box>
               </SettingRowInline>
+              <SettingRowInline title={t('settings.auto_update_rules.title')} desc={t('settings.auto_update_rules.desc')} icon={<RefreshCcw size={18} />}>
+                <FormControlLabel
+                  control={<Switch checked={autoUpdateRules} onChange={(e) => handleToggleAutoUpdateRules(e.target.checked)} />}
+                  label={t('settings.auto_update_rules.title')}
+                  sx={{ gap: 1, marginLeft: 0, marginRight: 0 }}
+                />
+              </SettingRowInline>
+            </Box>
+          </Box>
+
+          <Box data-tut="tun-section" sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1.5 }}>
+            <SectionHeader icon={<Wifi size={18} />} label={t('settings.tabs.tun')} />
+
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+              <SettingRowInline
+                title={t('settings.tun.outbound_iface.title')}
+                desc={t('settings.tun.outbound_iface.desc')}
+                icon={<Wifi size={18} />}
+              >
+                <Box sx={{ width: 320, flexShrink: 0 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel id="tun-outbound-iface-label">{t('settings.tun.outbound_iface.title')}</InputLabel>
+                    <Select
+                      labelId="tun-outbound-iface-label"
+                      id="tun-outbound-iface"
+                      value={outboundIface}
+                      label={t('settings.tun.outbound_iface.title')}
+                      onClose={blurSelectAfterClose}
+                      onChange={(e) => {
+                        const value = String(e.target.value);
+                        setOutboundIface(value);
+                        SetTUNInterface(value).catch((err: any) => {
+                          toast.error(t('common.failed'), String(err));
+                        });
+                      }}
+                    >
+                      <MenuItem value="">{t('settings.tun.outbound_iface.auto')}</MenuItem>
+                      {ifaces.map((nic) => (
+                        <MenuItem key={`${nic.name}-${nic.index}`} value={nic.name}>
+                          {renderInterfaceOption(nic)}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <Autocomplete
+                    multiple
+                    freeSolo
+                    size="small"
+                    fullWidth
+                    sx={{ mt: 1 }}
+                    options={ifaces.map((nic) => nic.name)}
+                    value={outboundExclude}
+                    inputValue={outboundExcludeInput}
+                    onInputChange={(_, newInputValue) => {
+                      // Controlled input: keep the text field content in sync so we can handle unsubmitted text on blur.
+                      setOutboundExcludeInput(newInputValue);
+                    }}
+                    onChange={(_, newValue) => {
+                      setOutboundExclude(newValue as string[]);
+                      // Clear the input after a tag is selected/created.
+                      setOutboundExcludeInput('');
+                    }}
+                    onBlur={() => {
+                      const raw = outboundExcludeInput.trim();
+                      if (raw) {
+                        // Support comma and full-width comma as separators; split into multiple tags at once.
+                        const parts = raw.split(/[,，]+/).map((s) => s.trim()).filter(Boolean);
+                        const merged = [...outboundExclude];
+                        for (const p of parts) {
+                          if (!merged.includes(p)) merged.push(p);
+                        }
+                        if (merged.length !== outboundExclude.length) {
+                          setOutboundExclude(merged);
+                          setOutboundExcludeInput('');
+                          saveExclude(merged);
+                          return;
+                        }
+                      }
+                      // No new content; just persist the current tags.
+                      saveExclude(outboundExclude);
+                    }}
+                    // To make Autocomplete match the Select styling: slotProps.popper is the only
+                    // channel that can reach the Portal-rendered dropdown whose inline width is
+                    // hard-coded by JS. width:max-content overrides that inline width so the menu
+                    // grows with its content; the Paper layer must also be overridden or the
+                    // white panel will still be narrow.
+                    slotProps={{
+                      popper: {
+                        sx: {
+                          width: 'max-content !important',
+                          '& .MuiAutocomplete-paper': {
+                            width: 'max-content',
+                            minWidth: 320,
+                          },
+                        },
+                      },
+                    }}
+                    renderValue={(value: string[], getItemProps) =>
+                      value.map((option: string, index: number) => (
+                        <Chip
+                          variant="outlined"
+                          label={option}
+                          size="small"
+                          {...getItemProps({ index })}
+                        />
+                      ))
+                    }
+                    renderOption={(props, option) => {
+                      const nic = ifaces.find((n) => n.name === option);
+                      return (
+                        <Box component="li" {...props}>
+                          {nic ? renderInterfaceOption(nic) : option}
+                        </Box>
+                      );
+                    }}
+                    renderInput={(params) => {
+                      // Validation for committed tags: must contain no "*" and must exist in the system NIC list.
+                      const tagsInvalid = outboundExclude.some(
+                        (val) => !val.includes('*') && !ifaces.some((nic) => nic.name === val)
+                      );
+                      const hasInvalidInput = tagsInvalid;
+                      return (
+                        <TextField
+                          {...params}
+                          label={t('settings.tun.outbound_exclude.label')}
+                          placeholder={t('settings.tun.outbound_exclude.placeholder')}
+                          error={hasInvalidInput}
+                          helperText={
+                            hasInvalidInput
+                              ? t('settings.tun.outbound_exclude.error')
+                              : t('settings.tun.outbound_exclude.hint')
+                          }
+                        />
+                      );
+                    }}
+                  />
+                </Box>
+              </SettingRowInline>
+
+              <SettingRowInline
+                title={t('settings.tun.stack.title')}
+                desc={t('settings.tun.stack.desc')}
+                icon={<SettingsIcon size={18} />}
+              >
+                <Box sx={{ width: 220, flexShrink: 0 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel id="tun-stack-label">{t('settings.tun.stack.title')}</InputLabel>
+                    <Select
+                      labelId="tun-stack-label"
+                      id="tun-stack"
+                      value={tunStack}
+                      label={t('settings.tun.stack.title')}
+                      onClose={blurSelectAfterClose}
+                      onChange={(e) => {
+                        const value = String(e.target.value);
+                        setTunStack(value);
+                        saveTUNField({ stack: value });
+                      }}
+                    >
+                      <MenuItem value="gvisor">{t('settings.tun.stack.gvisor')}</MenuItem>
+                      <MenuItem value="mixed">{t('settings.tun.stack.mixed')}</MenuItem>
+                      <MenuItem value="system">{t('settings.tun.stack.system')}</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Box>
+              </SettingRowInline>
+
+              <SettingRowInline
+                title={t('settings.tun.adapter_name.title')}
+                desc={t('settings.tun.adapter_name.desc')}
+                icon={<SettingsIcon size={18} />}
+              >
+                <Box sx={{ width: 220, flexShrink: 0 }}>
+                  <TextField
+                    size="small"
+                    fullWidth
+                    placeholder="SniShaper"
+                    value={adapterName}
+                    onChange={(e) => setAdapterName(e.target.value)}
+                    onBlur={() => saveTUNField({ adapter_name: adapterName.trim() })}
+                  />
+                </Box>
+              </SettingRowInline>
+
+              <SettingRowInline
+                title={t('settings.tun.route_exclude.title')}
+                desc={t('settings.tun.route_exclude.desc')}
+                icon={<Globe size={18} />}
+              >
+                <Box sx={{ width: 320, flexShrink: 0 }}>
+                  <TextField
+                    size="small"
+                    fullWidth
+                    placeholder="192.168.0.0/16,10.0.0.0/8"
+                    value={routeExclude}
+                    onChange={(e) => setRouteExclude(e.target.value)}
+                    onBlur={() => saveTUNField({ route_exclude_address: routeExclude.split(',').map((v) => v.trim()).filter(Boolean) })}
+                  />
+                </Box>
+              </SettingRowInline>
             </Box>
           </Box>
 
@@ -646,6 +1017,13 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                 <FormControlLabel
                   control={<Switch checked={autoEnableProxyOnAutoStart} onChange={(e) => handleToggleAutoEnableProxyOnAutoStart(e.target.checked)} />}
                   label={t('settings.auto_proxy.title')}
+                  sx={{ gap: 1, marginLeft: 0, marginRight: 0 }}
+                />
+              </SettingRowInline>
+              <SettingRowInline title={t('settings.auto_sysproxy.title')} desc={t('settings.auto_sysproxy.desc')} icon={<Anchor size={18} />}>
+                <FormControlLabel
+                  control={<Switch checked={autoEnableSysProxyOnAutoStart} onChange={(e) => handleToggleAutoEnableSysProxyOnAutoStart(e.target.checked)} />}
+                  label={t('settings.auto_sysproxy.title')}
                   sx={{ gap: 1, marginLeft: 0, marginRight: 0 }}
                 />
               </SettingRowInline>
@@ -687,7 +1065,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
               </SettingRowInline>
             </Box>
 
-            <StackedRow title={t('settings.ca_management.title')} desc={caStatus?.Installed ? t('dashboard.cert_installed') : t('dashboard.cert_not_installed')} icon={<ShieldAlert size={18} />}>
+            <StackedRow data-tut="cert-section" title={t('settings.ca_management.title')} desc={caStatus?.Installed ? t('dashboard.cert_installed') : t('dashboard.cert_not_installed')} icon={<ShieldAlert size={18} />}>
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                 <Typography variant="body2" sx={{ fontWeight: 'bold', color: caStatus?.Installed ? 'success.main' : 'text.secondary' }}>
                   {caStatus?.Installed ? t('settings.certs_count', { count: installedCerts.length }) : t('common.off')}
@@ -716,7 +1094,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                           disabled={isCertBusy}
                           onClick={() => handleUninstallCert(cert.token)}
                         >
-                          <Trash2 size={16} />
+                          <Delete size={16} />
                           {t('common.delete')}
                         </Button>
                       </Box>
@@ -770,7 +1148,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
 
         <Grid size={12}>
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-            <SectionHeader icon={<CloudLightning size={18} />} label={t('rules.form.cf_pool')}
+            <SectionHeader icon={<Bolt size={18} />} label={t('rules.form.cf_pool')}
               action={<Button size="small" variant="text" disabled={isCheckingHealth} onClick={handleHealthCheck}>
                 {isCheckingHealth ? t('ech_form.probing') : t('dns.test')}
               </Button>}
@@ -796,7 +1174,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                       <Typography variant="caption" sx={{ fontWeight: 'bold', textTransform: 'uppercase', color: 'text.secondary', letterSpacing: '0.05em' }}>
                         {t('settings.ip_pool', { count: ipStats.length })}
                       </Typography>
-                      <Zap size={16} color="warning.main" />
+                      <Bolt size={16} color="warning.main" />
                     </Box>
                     <Grid container columns={{ xs: 1, sm: 2 }} spacing={1} sx={{ maxHeight: 400, overflowY: 'auto', px: 1, pb: 2 }}>
                       {ipStats.length === 0 ? (
@@ -815,7 +1193,7 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
                               <Box sx={{ p: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: 'background.default', '&:hover': { borderColor: 'primary.main' }, transition: 'all 0.15s' }}>
                                 <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', minWidth: 0 }}>
                                   <Box sx={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, bgcolor: ok ? 'success.main' : 'error.main', boxShadow: ok ? '0 0 8px rgba(34,197,94,0.5)' : undefined }} />
-                                  <Typography variant="caption" sx={{ fontFamily: 'monospace', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  <Typography variant="caption" sx={{ fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                     {ip.ip}
                                   </Typography>
                                 </Box>
@@ -837,10 +1215,60 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
 
         <Grid size={12}>
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+            <SectionHeader icon={<Globe size={18} />} label={t('settings.ip_pools.title')}
+              action={<Typography variant="caption" sx={{ color: 'text.secondary', px: 1 }}>{t('settings.ip_pools.subtitle')}</Typography>}
+            />
+
+            <Box sx={{ p: 2, bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2, display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+              {ipPools.length === 0 && (
+                <Typography variant="caption" sx={{ color: 'text.secondary', px: 1, py: 0.5 }}>
+                  {t('settings.ip_pools.empty')}
+                </Typography>
+              )}
+              {ipPools.map((pool: any) => (
+                <Box key={pool.name} sx={{ p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: 'background.default', display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                  <Globe size={14} />
+                  <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 'bold', display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {pool.name}
+                    </Typography>
+                    <Typography variant="caption" sx={{ fontSize: 10, color: 'text.secondary' }}>
+                      {t('settings.ip_pools.ip_count', { count: (pool.preferred_ips || []).length })}
+                    </Typography>
+                  </Box>
+                  <Button size="small" variant="text" color="error" onClick={() => handleRemovePool(pool.name)}>
+                    {t('common.delete')}
+                  </Button>
+                </Box>
+              ))}
+
+              <Divider />
+              <Grid container columns={12} spacing={1}>
+                <Grid size={{ xs: 12, sm: 4 }}>
+                  <TextField size="small" fullWidth label={t('settings.ip_pools.name_label')} placeholder="cloudfront"
+                    value={newPoolName} onChange={(e) => setNewPoolName(e.target.value)} />
+                </Grid>
+                <Grid size={{ xs: 12, sm: 6 }}>
+                  <TextField size="small" fullWidth multiline minRows={1} maxRows={3}
+                    label={t('settings.ip_pools.ips_label')} placeholder="13.226.69.219, 13.226.69.220"
+                    value={newPoolIPs} onChange={(e) => setNewPoolIPs(e.target.value)} />
+                </Grid>
+                <Grid size={{ xs: 12, sm: 2 }} sx={{ display: 'flex', alignItems: 'center' }}>
+                  <Button size="small" variant="outlined" fullWidth disabled={!newPoolName.trim() || !newPoolIPs.trim()} onClick={handleAddPool}>
+                    {t('settings.ip_pools.add')}
+                  </Button>
+                </Grid>
+              </Grid>
+            </Box>
+          </Box>
+        </Grid>
+
+        <Grid size={12}>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
             <SectionHeader icon={<FileText size={18} />} label={t('settings.tabs.logs')}
               action={<Button size="small" variant="outlined" disabled={isCleaningLogs} onClick={handleCleanLogs}>
                 <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
-                  <Trash2 size={16} />
+                  <Delete size={16} />
                   {t('settings.logs.clean')}
                 </Box>
               </Button>}
@@ -880,7 +1308,9 @@ const Settings: React.FC<SettingsProps> = ({ cache, onCacheUpdate, currentThemeI
             </StackedRow>
           </Box>
         </Grid>
+
       </Grid>
+      </Box>
     </Box>
   );
 };

@@ -11,13 +11,26 @@ export const GetShowMainWindowOnAutoStart = () => appCall('GetShowMainWindowOnAu
 export const SetShowMainWindowOnAutoStart = (enabled: boolean) => appCall('SetShowMainWindowOnAutoStart', enabled);
 export const GetAutoEnableProxyOnAutoStart = () => appCall('GetAutoEnableProxyOnAutoStart');
 export const SetAutoEnableProxyOnAutoStart = (enabled: boolean) => appCall('SetAutoEnableProxyOnAutoStart', enabled);
+export const GetAutoEnableSysProxyOnAutoStart = () => appCall('GetAutoEnableSysProxyOnAutoStart');
+export const SetAutoEnableSysProxyOnAutoStart = (enabled: boolean) => appCall('SetAutoEnableSysProxyOnAutoStart', enabled);
+export const GetAutoUpdateRules = () => appCall('GetAutoUpdateRules');
+export const SetAutoUpdateRules = (enabled: boolean) => appCall('SetAutoUpdateRules', enabled);
+export const UpdateRules = () => appCall('UpdateRules');
 export const GetLanguage = () => appCall('GetLanguage');
 export const SetLanguage = (lang: string) => appCall('SetLanguage', lang);
 export const GetTheme = () => appCall('GetTheme');
 export const SetTheme = (theme: string) => appCall('SetTheme', theme);
+export const GetAppearanceMode = () => appCall('GetAppearanceMode');
+export const SetAppearanceMode = (mode: string) => appCall('SetAppearanceMode', mode);
 export const GetTUNConfig = () => appCall('GetTUNConfig');
 export const UpdateTUNConfig = (cfg: any) => appCall('UpdateTUNConfig', cfg);
 export const GetTUNStatus = () => appCall('GetTUNStatus');
+export const GetFragmentConfig = () => appCall('GetFragmentConfig');
+export const SetFragmentConfig = (cfg: any) => appCall('SetFragmentConfig', cfg);
+export const ResetFragmentConfig = () => appCall('ResetFragmentConfig');
+export const GetNetworkInterfaces = () => appCall('GetNetworkInterfaces');
+export const SetTUNInterface = (name: string) => appCall('SetTUNInterface', name);
+export const SetTUNInterfaceExclude = (exclude: string) => appCall('SetTUNInterfaceExclude', exclude);
 export const GetIPv6Available = () => appCall('GetIPv6Available');
 export const RefreshIPv6Check = () => appCall('RefreshIPv6Check');
 export const StartTUN = () => appCall('StartTUN');
@@ -29,6 +42,9 @@ export const CleanOldLogs = () => appCall('CleanOldLogs');
 export const DeleteECHProfile = (id: string) => appCall('DeleteECHProfile', id);
 export const DeleteSiteGroup = (id: string) => appCall('DeleteSiteGroup', id);
 export const DeleteUpstream = (id: string) => appCall('DeleteUpstream', id);
+export const GetRulesLayerInfo = () => appCall('GetRulesLayerInfo');
+export const RevertSiteGroupToUpstream = (id: string) => appCall('RevertSiteGroupToUpstream', id);
+export const RevertUpstreamConfigToUpstream = (id: string) => appCall('RevertUpstreamConfigToUpstream', id);
 export const DisableSystemProxy = () => appCall('DisableSystemProxy');
 export const EnableSystemProxy = () => appCall('EnableSystemProxy');
 export const ExportCert = () => appCall('ExportCert');
@@ -46,12 +62,37 @@ export const GetInstalledCerts = () => appCall('GetInstalledCerts');
 export const IsLogCaptureEnabled = () => appCall('IsLogCaptureEnabled');
 export const GetListenPort = () => appCall('GetListenPort');
 export const GetPortOccupant = (port: number) => appCall('GetPortOccupant', port);
-export const KillPortOccupant = (pid: number) => appCall('KillPortOccupant', pid);
+export const KillPortOccupant = (port: number, pid: number) => appCall('KillPortOccupant', port, pid);
 export const OpenLogFile = (name: string) => appCall('OpenLogFile', name);
 export const GetLogFiles = () => appCall('GetLogFiles');
 export const GetProxyDiagnostics = () => appCall('GetProxyDiagnostics');
 export const GetProxyMode = () => appCall('GetProxyMode');
 export const GetRecentLogs = (limit: number) => appCall('GetRecentLogs', limit);
+
+// Live connection viewer
+export const GetActiveConnections = () => appCall('GetActiveConnections');
+
+// Rule match explanation (simulated, same pipeline as live matching)
+export const ExplainMatch = (host: string, process: string) => appCall('ExplainMatch', host, process);
+
+// Diagnostic export (sanitized zip for bug reports)
+export const PreviewDiagnosticsExport = () => appCall('PreviewDiagnosticsExport');
+export const ExportDiagnostics = () => appCall('ExportDiagnostics');
+export const RevealDiagnosticsExport = (path: string) => appCall('RevealDiagnosticsExport', path);
+
+// Startup network recovery (leftover system proxy from a crashed run)
+export const GetNetworkRecoveryReport = () => appCall('GetNetworkRecoveryReport');
+
+// Configuration profiles (named snapshots of settings + rules)
+export const ListProfiles = () => appCall('ListProfiles');
+export const GetActiveProfile = () => appCall('GetActiveProfile');
+export const CreateProfile = (name: string) => appCall('CreateProfile', name);
+export const RenameProfile = (oldName: string, newName: string) => appCall('RenameProfile', oldName, newName);
+export const DuplicateProfile = (srcName: string, dstName: string) => appCall('DuplicateProfile', srcName, dstName);
+export const SwitchProfile = (name: string) => appCall('SwitchProfile', name);
+export const ExportProfile = (name: string) => appCall('ExportProfile', name);
+export const ImportProfile = (bundleJson: string) => appCall('ImportProfile', bundleJson);
+export const RevealProfileExport = (path: string) => appCall('RevealProfileExport', path);
 
 export const GetSiteGroups = () => appCall('GetSiteGroups');
 export const GetStats = () => appCall('GetStats');
@@ -71,16 +112,22 @@ export const RegenerateCert = () => appCall('RegenerateCert');
 export const RemoveInvalidCFIPs = () => appCall('RemoveInvalidCFIPs');
 export const SetCloseToTray = (enabled: boolean) => appCall('SetCloseToTray', enabled);
 export const SetListenPort = (port: number) => appCall('SetListenPort', port);
-export const GetSocks5Enabled = () => appCall('GetSocks5Enabled');
-export const SetSocks5Enabled = (enabled: boolean) => appCall('SetSocks5Enabled', enabled);
-export const GetSocks5Port = () => appCall('GetSocks5Port');
-export const SetSocks5Port = (port: string) => appCall('SetSocks5Port', port);
+
 export const SetProxyMode = (mode: string) => appCall('SetProxyMode', mode);
 export const StartLogCapture = () => appCall('StartLogCapture');
 export const StartProxy = () => appCall('StartProxy');
 export const StopLogCapture = () => appCall('StopLogCapture');
 export const StopProxy = () => appCall('StopProxy');
 export const TriggerCFHealthCheck = () => appCall('TriggerCFHealthCheck');
+
+// Named IP pools (cloudfront, user-defined CDNs)
+export const GetIPPools = () => appCall('GetIPPools');
+export const UpdateIPPools = (pools: any[]) => appCall('UpdateIPPools', pools);
+export const GetIPPoolStats = (name: string) => appCall('GetIPPoolStats', name);
+export const ForceFetchIPPoolIPs = (name: string) => appCall('ForceFetchIPPoolIPs', name);
+export const RefreshIPPool = (name: string) => appCall('RefreshIPPool', name);
+export const RemoveInvalidIPPoolIPs = (name: string) => appCall('RemoveInvalidIPPoolIPs', name);
+export const TriggerIPPoolHealthCheck = (name: string) => appCall('TriggerIPPoolHealthCheck', name);
 export const UninstallCert = (thumbprint: string) => appCall('UninstallCert', thumbprint);
 export const UpdateCloudflareConfig = (cfg: any) => appCall('UpdateCloudflareConfig', cfg);
 
@@ -94,8 +141,10 @@ export const WindowToggleMaximise = () => appCall('WindowToggleMaximise');
 export const GetAutoRoutingConfig = () => appCall('GetAutoRoutingConfig');
 export const UpdateAutoRoutingConfig = (cfg: any) => appCall('UpdateAutoRoutingConfig', cfg);
 export const GetAutoRoutingStatus = () => appCall('GetAutoRoutingStatus');
-export const RefreshGFWList = () => appCall('RefreshGFWList');
 
+
+export const GetTutorialDone = () => appCall('GetTutorialDone');
+export const SetTutorialDone = () => appCall('SetTutorialDone');
 
 // About API
 export const GetAppVersion = () => appCall('GetAppVersion');
@@ -140,4 +189,9 @@ export const SetMigrationEnabled = (enabled: boolean) => appCall('SetMigrationEn
 export const GetMigrationServer = () => appCall('GetMigrationServer');
 export const SetMigrationServer = (server: string) => appCall('SetMigrationServer', server);
 export const TestMigration = (server: string) => appCall('TestMigration', server);
+
+// Config migration report (startup config load; unrelated to the migration proxy mode)
+export const GetLastMigrationReport = () => appCall('GetLastMigrationReport');
+
+export const GetNotices = (force: boolean) => appCall('GetNotices', force);
 

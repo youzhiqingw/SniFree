@@ -15,76 +15,85 @@ import (
 
 	"snishaper/common"
 	"snishaper/core"
-	"snishaper/evolution"
-	"snishaper/pkg/certmanager"
-	"snishaper/proxy"
-
-	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/SnishaperTeam/snishaper-core/certmanager"
+	"github.com/SnishaperTeam/snishaper-core/evolution"
+	"github.com/SnishaperTeam/snishaper-core/netiface"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
+// UIAdapter is an optional event sink used by headless builds (the CLI /
+// TUI) to receive app-level state events without a wails runtime. The
+// desktop build ignores it entirely.
+type UIAdapter interface {
+	Emit(event string, payload interface{})
+}
+
 type App struct {
-	wailsApp          *application.App
-	mainWindow        *application.WebviewWindow
-	proxyServer       *proxy.ProxyServer
-	certManager       *certmanager.CertManager
-	ruleManager       *proxy.RuleManager
-	evolutionTester   *evolution.Tester
-	certPath          string
-	proxyMarkerPath   string
-	logBuffer         *common.RingLogWriter
-	logDir            string
-	logFilePath       string
-	logFile           *os.File
-	logFileMu         sync.Mutex
-	logCaptureMu      sync.RWMutex
-	logCaptureEnabled bool
-	shouldQuit        bool
-	systemTray        *application.SystemTray
-	trayMenuV3        *application.Menu
-	proxyItemV3       *application.MenuItem
-	systemProxyItemV3 *application.MenuItem
-	proxyOpMu         sync.Mutex // lock order: proxyOpMu → systemProxyOpMu (never reverse)
-	systemProxyOpMu   sync.Mutex
-	wg                sync.WaitGroup
-	ctx               context.Context
-	cancel            context.CancelFunc
-	launchedAtStartup bool
-	autoProxyAtStartup bool
-	core              *core.CoreClient
-	tunRestoreSysProxy bool
-	pendingShow       bool
-	pendingUpdateMu   sync.Mutex
-	pendingUpdatePath string
+	// GUI-only UI references. Kept as `any` so the headless build (with the
+	// `headless` build tag) never links the wails runtime; the GUI build
+	// accesses them through the typed helpers in app_ui_wails.go.
+	wailsApp     any // *application.App
+	mainWindow   any // *application.WebviewWindow
+	systemTray   any // *application.SystemTray
+	trayMenuV3   any // *application.Menu
+	proxyItemV3  any // *application.MenuItem
+	systemProxyItemV3 any // *application.MenuItem
+
+	// Headless-only event sink (set via SetUIAdapter in the CLI build).
+	ui          UIAdapter
+	cliMode     bool
+	silentStdout bool
+
+	proxyServer         *proxy.ProxyServer
+	certManager         *certmanager.CertManager
+	certManagerMu       sync.Mutex // 保护 certManager：GUI 绑定与启动钩子并发初始化
+	ruleManager         *proxy.RuleManager
+	settingsPath        string
+	rulesPath           string
+	evolutionTester     *evolution.Tester
+	evolutionTesterMu   sync.Mutex
+	certPath            string
+	proxyMarkerPath     string
+	logBuffer           *common.RingLogWriter
+	logDir              string
+	logFilePath         string
+	logFile             *os.File
+	logFileMu           sync.Mutex
+	logCaptureMu        sync.RWMutex
+	logCaptureEnabled   bool
+	shouldQuit          bool
+	proxyOpMu           sync.Mutex // lock order: proxyOpMu → systemProxyOpMu (never reverse)
+	systemProxyOpMu     sync.Mutex
+	wg                  sync.WaitGroup
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	launchedAtStartup   bool
+	autoProxyAtStartup  bool
+	recoveryReport      LeftoverSystemProxyReport
+	// startupMigrationReport 是启动加载配置时产生的迁移/校验报告，
+	// 由 GetLastMigrationReport 暴露给前端展示（无内容时各列表为空）。
+	startupMigrationReport proxy.MigrationReport
+	core                *core.CoreClient
+	// ifaces 用于 UI 侧网卡列举与配置变更后的缓存失效。
+	ifaces *netiface.Selector
+	tunSysProxyMu       sync.Mutex // 保护 tunRestoreSysProxy：调用方与 StartTUN 异步 goroutine 并发访问
+	tunRestoreSysProxy  bool
+	pendingShow         bool
+	pendingUpdateMu     sync.Mutex
+	pendingUpdatePath   string
+	pendingUpdateSHA    string // 待安装更新包校验通过的 SHA-256
+	downloadConcurrency int
+	downloadChunkSize   int64
+	sourceRankMu        sync.Mutex
+	sourceRankCache     map[string][]string
+	sourceRankAt        map[string]time.Time
+	rulesWatchMu        sync.Mutex
+	rulesWatchStop      func()
+
+	noticesMu      sync.Mutex
+	noticesPayload *NoticesPayload
+	noticesFetched time.Time
 }
-
-// SetWailsApp sets the wails application instance.
-func (a *App) SetWailsApp(w *application.App) { a.wailsApp = w }
-
-// SetMainWindow sets the main window reference.
-func (a *App) SetMainWindow(w *application.WebviewWindow) {
-	if w != nil {
-		a.mainWindow = w
-		if a.pendingShow {
-			a.mainWindow.Show()
-			a.mainWindow.Focus()
-			a.pendingShow = false
-		}
-	} else {
-		a.mainWindow = w
-	}
-}
-
-// SetSystemTray sets the system tray reference.
-func (a *App) SetSystemTray(t *application.SystemTray) { a.systemTray = t }
-
-// SetTrayMenu sets the tray menu reference.
-func (a *App) SetTrayMenu(m *application.Menu) { a.trayMenuV3 = m }
-
-// SetProxyMenuItem sets the proxy menu item reference.
-func (a *App) SetProxyMenuItem(i *application.MenuItem) { a.proxyItemV3 = i }
-
-// SetSystemProxyMenuItem sets the system proxy menu item reference.
-func (a *App) SetSystemProxyMenuItem(i *application.MenuItem) { a.systemProxyItemV3 = i }
 
 // ShouldQuit returns whether the app should quit.
 func (a *App) ShouldQuit() bool { return a.shouldQuit }
@@ -108,8 +117,14 @@ func (a *App) setupFileLogger() {
 		a.logBuffer = common.NewRingLogWriter(500)
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.SetOutput(io.MultiWriter(&gatedLogWriter{app: a}, os.Stdout))
+	if a.silentStdout {
+		log.SetOutput(&gatedLogWriter{app: a})
+	} else {
+		log.SetOutput(io.MultiWriter(&gatedLogWriter{app: a}, os.Stdout))
+	}
 	a.openLogFile()
+	a.noteCrashLog()
+	a.reportPreviousRun()
 }
 
 // openLogFile creates a new timestamped log file for this run in
@@ -156,6 +171,10 @@ func (a *App) writeLogFile(s string) {
 	}
 }
 
+// Hoisted so appendLog's hot path (every log line) does not recompile or
+// re-lookup the pattern per call.
+var logLinePrefixRe = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`)
+
 func (a *App) appendLog(message string) {
 	trimmed := strings.TrimSpace(message)
 	if trimmed == "" {
@@ -163,7 +182,7 @@ func (a *App) appendLog(message string) {
 	}
 
 	var formatted string
-	if matched, _ := regexp.MatchString(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`, trimmed); matched {
+	if logLinePrefixRe.MatchString(trimmed) {
 		formatted = trimmed
 	} else {
 		formatted = time.Now().Format("2006/01/02 15:04:05.000000") + " " + trimmed
@@ -246,16 +265,9 @@ func (a *App) StopLogCapture() error {
 	return nil
 }
 
-func (a *App) ServiceStartup(ctx context.Context, options application.ServiceOptions) error {
-	a.startupV3()
-	return nil
-}
-
-func (a *App) ServiceShutdown() error {
-	a.shutdown()
-	return nil
-}
-
+// startupV3 performs the shared service startup sequence; the wails
+// Service entry points (app_ui_wails.go) and the headless entry point
+// (StartupCLI, app_headless.go) both delegate here.
 func (a *App) startupV3() {
 	a.setupFileLogger()
 	log.Printf("[startup] SniShaper startup hook entered")
@@ -270,19 +282,20 @@ func (a *App) startupV3() {
 			a.launchedAtStartup, a.autoProxyAtStartup, a.GetAutoEnableProxyOnAutoStart()))
 	}
 
-	var err error
-	a.certManager, err = certmanager.InitCertManager(a.certPath)
-	if err != nil {
-		a.appendLog("[startup] Failed to init cert manager: " + err.Error())
+	if cm, cmErr := certmanager.InitCertManager(a.certPath); cmErr != nil {
+		a.appendLog("[startup] Failed to init cert manager: " + cmErr.Error())
 	} else {
+		a.setCertManager(cm)
 		a.appendLog("[startup] Cert manager initialized: " + a.certPath)
 	}
 
 	if err := a.ruleManager.LoadConfig(); err != nil {
 		a.appendLog("[startup] Failed to load config: " + err.Error())
 	}
-	if err := a.syncAutoStartRegistration(); err != nil {
-		a.appendLog("[startup] Auto-start sync check failed: " + err.Error())
+	if !a.cliMode {
+		if err := a.syncAutoStartRegistration(); err != nil {
+			a.appendLog("[startup] Auto-start sync check failed: " + err.Error())
+		}
 	}
 
 	if a.core != nil {
@@ -293,6 +306,11 @@ func (a *App) startupV3() {
 		}
 	}
 
+	// Recover network state a crashed previous instance may have left behind
+	// (system proxy still pointing at a dead listener). Runs before the
+	// auto-enable logic so a re-enable lands on top of a clean state.
+	a.recoveryReport = a.recoverLeftoverSystemProxy()
+
 	if a.ShouldAutoEnableProxyOnAutoStart() {
 		a.appendLog("[startup] AutoStart: Auto-enabling proxy as configured")
 		a.runSafeAsync("startup proxy sync", func() {
@@ -300,10 +318,24 @@ func (a *App) startupV3() {
 		})
 	}
 
+	if a.GetAutoUpdateRules() {
+		a.appendLog("[startup] AutoUpdate: rules sync scheduled")
+		a.runSafeAsync("startup rules update", func() {
+			select {
+			case <-time.After(autoRulesUpdateDelay):
+			case <-a.ctx.Done():
+				return
+			}
+			a.syncRemoteRules()
+		})
+	}
+
 	a.startIPv6Monitor()
 	a.RefreshIPv6Check()
 	a.startRouteEventsPoller()
 	a.startLogFileMirror()
+	a.serveInstanceListener()
+	a.startRulesWatcher()
 }
 
 // autoEnableProxyAtStartup starts the proxy (and system proxy) with backoff
@@ -316,8 +348,12 @@ func (a *App) autoEnableProxyAtStartup() {
 	for attempt := 0; ; attempt++ {
 		err := a.StartProxy()
 		if err == nil {
-			if sysErr := a.EnableSystemProxy(); sysErr != nil {
-				a.appendLog("[startup] AutoStart EnableSystemProxy failed: " + sysErr.Error())
+			if a.GetAutoEnableSysProxyOnAutoStart() {
+				if sysErr := a.EnableSystemProxy(); sysErr != nil {
+					a.appendLog("[startup] AutoStart EnableSystemProxy failed: " + sysErr.Error())
+				}
+			} else {
+				a.appendLog("[startup] AutoStart: system proxy left off by configuration")
 			}
 			a.appendLog(fmt.Sprintf("[startup] AutoStart proxy enabled (attempt %d)", attempt+1))
 			return
@@ -326,7 +362,7 @@ func (a *App) autoEnableProxyAtStartup() {
 		if attempt >= len(delays) {
 			a.appendLog("[startup] AutoStart proxy enable failed after all retries; proxy left off")
 			if a.systemTray != nil {
-				a.systemTray.SetTooltip("SniShaper: 开机自启代理启动失败，请手动开启代理")
+				a.setTrayTooltip("SniShaper: 开机自启代理启动失败，请手动开启代理")
 			}
 			return
 		}
@@ -340,9 +376,12 @@ func (a *App) autoEnableProxyAtStartup() {
 
 // startRouteEventsPoller forwards route events from the core process to the
 // frontend (app:route), since the core RPC only buffers them for polling.
+// Each poll is a fresh RPC connection, so an idle proxy backs off: 500 ms
+// while events keep arriving, growing to 4 s when there is nothing to fetch.
 func (a *App) startRouteEventsPoller() {
 	a.runSafeAsync("route events poller", func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		interval := 500 * time.Millisecond
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -350,19 +389,30 @@ func (a *App) startRouteEventsPoller() {
 				return
 			case <-ticker.C:
 			}
-			if a.core == nil || a.mainWindow == nil {
+			if a.core == nil || !a.hasUI() {
 				continue
 			}
 			events := a.core.GetRouteEvents()
 			if len(events) == 0 {
+				// Empty (or the core is unreachable): poll less often. The
+				// core buffers at most 200 events, so a 4 s idle interval
+				// still drains everything long before the buffer turns over.
+				if interval < 4*time.Second {
+					interval *= 2
+					ticker.Reset(interval)
+				}
 				continue
 			}
+			if interval != 500*time.Millisecond {
+				interval = 500 * time.Millisecond
+				ticker.Reset(interval)
+			}
 			for _, e := range events {
-				application.InvokeAsync(func() {
-					if a.mainWindow == nil || a.shouldQuit {
+				a.invokeAsync(func() {
+					if !a.hasUI() || a.shouldQuit {
 						return
 					}
-					a.mainWindow.EmitEvent("app:route", map[string]interface{}{
+					a.emitEvent("app:route", map[string]interface{}{
 						"domain": e.Domain,
 						"mode":   e.Mode,
 					})
@@ -375,6 +425,7 @@ func (a *App) startRouteEventsPoller() {
 func (a *App) shutdown() {
 	a.appendLog("[shutdown] SniShaper shutdown hook entered")
 	a.cancel()
+	a.stopRulesWatcher()
 
 	var errs []string
 
@@ -389,9 +440,10 @@ func (a *App) shutdown() {
 		}
 	}
 
-	// 2. Disable system proxy synchronously
-	status := a.GetSystemProxyStatus()
-	if status.Enabled {
+	// 2. Disable system proxy synchronously — only when it is the proxy this
+	// app configured. A user's own or third-party proxy setting must survive
+	// our exit (same rule as StopProxy and startup recovery).
+	if a.IsManagedSystemProxy() {
 		a.appendLog("[shutdown] Disabling system proxy...")
 		if err := a.applySystemProxySync(false, 0, true); err != nil {
 			errs = append(errs, "SystemProxy: "+err.Error())
@@ -415,6 +467,7 @@ func (a *App) shutdown() {
 	if len(errs) > 0 {
 		log.Printf("[shutdown] Shutdown completed with errors: %s", strings.Join(errs, "; "))
 	} else {
+		a.clearRunMarker()
 		log.Printf("[shutdown] Shutdown completed cleanly")
 	}
 
@@ -455,8 +508,7 @@ func (a *App) UpdateTrayMenu() {
 		proxyLabel = "代理: 开"
 	}
 	if a.proxyItemV3 != nil {
-		a.proxyItemV3.SetLabel(proxyLabel)
-		a.proxyItemV3.SetChecked(running)
+		a.updateTrayProxyItem(proxyLabel, running)
 	}
 
 	status := a.GetSystemProxyStatus()
@@ -465,7 +517,7 @@ func (a *App) UpdateTrayMenu() {
 		sysProxyLabel = "系统代理: 开"
 	}
 	if a.systemProxyItemV3 != nil {
-		a.systemProxyItemV3.SetLabel(sysProxyLabel)
+		a.updateTraySysProxyItem(sysProxyLabel)
 	}
 }
 
@@ -474,15 +526,15 @@ func (a *App) emitFrontendState() {
 		return
 	}
 	a.UpdateTrayMenu()
-	if a.mainWindow == nil {
+	if !a.hasUI() {
 		return
 	}
-	application.InvokeAsync(func() {
-		if a.mainWindow == nil || a.shouldQuit {
+	a.invokeAsync(func() {
+		if !a.hasUI() || a.shouldQuit {
 			return
 		}
 		tunStatus := a.GetTUNStatus()
-		a.mainWindow.EmitEvent("app:state_changed", map[string]interface{}{
+		a.emitEvent("app:state_changed", map[string]interface{}{
 			"proxyRunning":      a.IsProxyRunning(),
 			"systemProxyActive": a.GetSystemProxyStatus().Enabled,
 			"proxyMode":         a.GetProxyMode(),
@@ -554,5 +606,14 @@ func (a *App) ShouldStartHidden() bool {
 }
 
 func (a *App) ShouldAutoEnableProxyOnAutoStart() bool {
-	return (a.launchedAtStartup || a.autoProxyAtStartup) && a.GetAutoEnableProxyOnAutoStart()
+	if !a.GetAutoEnableProxyOnAutoStart() {
+		return false
+	}
+	// CLI and TUI are attended launches: they only auto-enable the proxy when
+	// asked to on the command line. The GUI applies the setting to every
+	// launch, so a double-click behaves like auto-start.
+	if a.cliMode {
+		return a.launchedAtStartup || a.autoProxyAtStartup
+	}
+	return true
 }

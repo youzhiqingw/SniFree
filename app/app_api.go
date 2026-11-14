@@ -13,8 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,20 +22,27 @@ import (
 
 	"snishaper/common"
 	"snishaper/core"
-	"snishaper/pkg/certmanager"
-	"snishaper/pkg/cfpool"
-	"snishaper/pkg/dohresolver"
-	"snishaper/proxy"
+	"snishaper/pkg/sysproxy"
+	"github.com/SnishaperTeam/snishaper-core/certmanager"
+	"github.com/SnishaperTeam/snishaper-core/cfpool"
+	"github.com/SnishaperTeam/snishaper-core/dohresolver"
+	"github.com/SnishaperTeam/snishaper-core/netiface"
+	corelog "github.com/SnishaperTeam/snishaper-core/log"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 func NewApp() *App {
 	execPath, _ := os.Executable()
 	execDir := filepath.Dir(execPath)
-	settingsPath := common.ResolveRuntimeFile(execDir, filepath.Join("config", "settings.json"))
-	rulesPath := common.ResolveRuntimeFile(execDir, filepath.Join("rules", "config.json"))
+	settingsPath := common.ConfigSettingsPath(execDir)
+	rulesPath := common.ConfigRulesPath(execDir)
 
-	ruleManager := proxy.NewRuleManager(settingsPath, rulesPath)
-	if err := ruleManager.LoadConfig(); err != nil {
+	ruleManager := proxy.NewRuleManager(settingsPath, rulesPath,
+		proxy.WithLogger(corelog.Std), proxy.WithRouterDebug(os.Getenv("SNISHAPER_ROUTER_DEBUG") == "1"))
+	// 带迁移报告加载：版本升级/字段修复/备份路径通过
+	// GetLastMigrationReport 展示给用户，加载失败保持原有回退行为。
+	migrationReport, err := ruleManager.LoadConfigWithMigration()
+	if err != nil {
 		log.Printf("[warn] Failed to load config at init: %v", err)
 	}
 
@@ -44,68 +51,44 @@ func NewApp() *App {
 		port = "8080"
 	}
 
-	socks5Port := ruleManager.GetSocks5Port()
-	if socks5Port == "" {
-		socks5Port = "8081"
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	proxyServer := proxy.NewProxyServer("127.0.0.1:" + port)
+	proxyServer := proxy.NewProxyServer("127.0.0.1:"+port, proxy.WithLogger(corelog.Std))
+	proxyServer.SetRuleManager(ruleManager)
 	a := &App{
-		ctx:               ctx,
-		cancel:            cancel,
-		proxyServer:       proxyServer,
-		ruleManager:       ruleManager,
-		certPath:          filepath.Join(execDir, "cert"),
-		proxyMarkerPath:   filepath.Join(execDir, "config", "system_proxy_owner.json"),
-		launchedAtStartup: HasLaunchArg("--startup"),
-		autoProxyAtStartup: HasLaunchArg("--autoproxy"),
-		core:              core.NewCoreClient(),
+		ctx:                    ctx,
+		cancel:                 cancel,
+		proxyServer:            proxyServer,
+		ruleManager:            ruleManager,
+		settingsPath:           settingsPath,
+		rulesPath:              rulesPath,
+		certPath:               common.ConfigCertDir(execDir),
+		proxyMarkerPath:        common.ConfigProxyMarker(execDir),
+		ifaces:                 netiface.NewSelector(),
+		launchedAtStartup:      HasLaunchArg("--startup"),
+		autoProxyAtStartup:     HasLaunchArg("--autoproxy"),
+		startupMigrationReport: migrationReport,
+		core:                   core.NewCoreClient(),
 	}
-	a.proxyServer.SetSocks5Addr("127.0.0.1:" + socks5Port)
+	// Download tuning is env-tunable but fixed for the process lifetime:
+	// resolving it here keeps the download goroutines off lazy field writes.
+	a.downloadConcurrency, a.downloadChunkSize = initDownloadTuning()
 
-	// Auto-restart when proxy server stops unexpectedly
-	a.proxyServer.OnStop = func(err error) {
-		a.appendLog("[error] Proxy server stopped unexpectedly: " + err.Error())
-		a.UpdateTrayMenu()
-		a.RunSafeAsync("proxy auto-restart", func() {
-			time.Sleep(2 * time.Second)
-			a.proxyOpMu.Lock()
-			defer a.proxyOpMu.Unlock()
-			if !a.proxyServer.IsRunning() {
-				if err2 := a.proxyServer.Start(); err2 != nil {
-					a.appendLog("[error] Proxy auto-restart failed: " + err2.Error())
-				} else {
-					a.appendLog("[action] Proxy auto-restarted successfully")
-				}
-				a.UpdateTrayMenu()
-				a.emitFrontendState()
-			}
-		})
-	}
-
-	// Set CF pool refresh callback — called async when pool is stale (>1 day)
 	a.proxyServer.SetCFRefreshCallback(func() {
 		a.RefreshCloudflareIPPool()
 	})
 
-	// Initialize Cloudflare IP pool and trigger background health check on startup
-	cf := ruleManager.GetCloudflareConfig()
-	if len(cf.PreferredIPs) > 0 {
-		a.proxyServer.UpdateCloudflareIPPool(cf.PreferredIPs)
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			select {
-			case <-time.After(1 * time.Second): // Wait for app to stabilize
-				a.proxyServer.TriggerCFHealthCheck()
-			case <-a.ctx.Done():
-				return
-			}
-		}()
+	// Initialize Cloudflare IP pool. ProxyServer.Start kicks off the pool's initial
+	// health check, so no extra trigger is needed here.
+	a.proxyServer.UpdateCloudflareIPPool(ruleManager.GetCloudflareConfig().PreferredIPs)
+
+	// Initialize named IP pools (cloudfront, user-defined CDNs).
+	for _, pc := range ruleManager.GetIPPoolsConfig() {
+		a.proxyServer.UpdateIPPool(pc.Name, pc.PreferredIPs)
+		if pc.AutoUpdate {
+			go a.RefreshIPPool(pc.Name)
+		}
 	}
 
-	// Initialize auto router (needed for GFW list refresh even without core)
 	ruleManager.InitAutoRouter(a.proxyServer.GetDoHResolver())
 
 	return a
@@ -140,28 +123,6 @@ func (a *App) StartProxy() error {
 		if err := a.SetListenPort(availablePort); err != nil {
 			a.appendLog("[warn] Failed to update config with new port: " + err.Error())
 		}
-	}
-
-	a.proxyServer.SetSocks5Enabled(true)
-	a.ruleManager.SetSocks5Enabled(true)
-	_ = a.ruleManager.SaveConfig()
-
-	socks5OriginalPort := a.ruleManager.GetSocks5Port()
-	if socks5OriginalPort == "" {
-		socks5OriginalPort = "8081"
-	}
-	socks5PortNum, err := strconv.Atoi(socks5OriginalPort)
-	if err == nil {
-		socks5Available, err := proxy.EnsurePortAvailable(socks5PortNum, []string{"snishaper", "usque"})
-		if err != nil {
-			a.appendLog(fmt.Sprintf("[warn] SOCKS5 port probe failed: %v, using original port", err))
-			socks5Available = socks5PortNum
-		}
-		if socks5Available != socks5PortNum {
-			a.appendLog(fmt.Sprintf("[info] SOCKS5 port %d was occupied. Switched to %d.", socks5PortNum, socks5Available))
-			a.ruleManager.SetSocks5Port(strconv.Itoa(socks5Available))
-		}
-		a.proxyServer.SetSocks5Addr(fmt.Sprintf("127.0.0.1:%d", socks5Available))
 	}
 
 	a.syncCFPoolNAT64Prefix()
@@ -199,6 +160,9 @@ func (a *App) StopProxy() error {
 	defer a.proxyOpMu.Unlock()
 
 	if a.core != nil {
+		if a.core.GetTUNStatus().Running {
+			_ = a.core.StopTUN()
+		}
 		err := a.core.StopProxy()
 		a.UpdateTrayMenu()
 		a.emitFrontendState()
@@ -318,44 +282,13 @@ func (a *App) SetListenPort(port int) error {
 }
 
 func (a *App) RevealMainWindow() {
-	if a.mainWindow != nil {
-		a.mainWindow.Show()
-		a.mainWindow.Focus()
+	if a.wailsApp == nil {
+		a.pendingShow = true
 		return
 	}
-	a.pendingShow = true
-}
-
-func (a *App) GetSocks5Enabled() bool {
-	return a.ruleManager.GetSocks5Enabled()
-}
-
-func (a *App) SetSocks5Enabled(enabled bool) error {
-	a.appendLog(fmt.Sprintf("[action] SetSocks5Enabled: %v", enabled))
-	a.proxyServer.SetSocks5Enabled(enabled)
-	a.ruleManager.SetSocks5Enabled(enabled)
-	_ = a.ruleManager.SaveConfig()
-	if a.core != nil {
-		var empty core.EmptyArgs
-		_ = a.core.Call("Core.SetSocks5Enabled", core.BoolReply{Value: enabled}, &empty)
-	}
-	return nil
-}
-
-func (a *App) GetSocks5Port() string {
-	return a.ruleManager.GetSocks5Port()
-}
-
-func (a *App) SetSocks5Port(port string) error {
-	a.appendLog(fmt.Sprintf("[action] SetSocks5Port: %s", port))
-	a.ruleManager.SetSocks5Port(port)
-	_ = a.ruleManager.SaveConfig()
-	a.proxyServer.SetSocks5Addr("127.0.0.1:" + port)
-	if a.core != nil {
-		var empty core.EmptyArgs
-		_ = a.core.Call("Core.SetSocks5Port", core.StringReply{Value: port}, &empty)
-	}
-	return nil
+	// showMainWindow recreates the window when the tracked one is gone, so a
+	// window destroyed behind the app's back can always be brought back.
+	a.showMainWindow()
 }
 
 func (a *App) GetProxyMode() string {
@@ -397,19 +330,72 @@ func (a *App) SetTheme(theme string) error {
 	return a.ruleManager.SetTheme(theme)
 }
 
+func (a *App) GetAppearanceMode() string {
+	return a.ruleManager.GetAppearanceMode()
+}
+
+func (a *App) SetAppearanceMode(mode string) error {
+	a.appendLog(fmt.Sprintf("[action] SetAppearanceMode called: %s", mode))
+	return a.ruleManager.SetAppearanceMode(mode)
+}
+
 func (a *App) GetTUNConfig() proxy.TUNConfig {
 	return a.ruleManager.GetTUNConfig()
 }
 
-func (a *App) UpdateTUNConfig(cfg proxy.TUNConfig) error {
-	a.appendLog("[action] UpdateTUNConfig called")
-	err := a.ruleManager.UpdateTUNConfig(cfg)
-	if err == nil {
-		if a.core != nil {
-			a.core.ReloadIfRunning()
+// SetTUNInterfaceExclude 设置出站网卡排除列表（逗号分隔，支持 name* 通配）。
+func (a *App) SetTUNInterfaceExclude(exclude string) error {
+	a.appendLog("[action] SetTUNInterfaceExclude called")
+	cfg := a.ruleManager.GetTUNConfig()
+	cfg.ExcludeInterfaces = splitCommaList(exclude)
+	if err := a.ruleManager.UpdateTUNConfig(cfg); err != nil {
+		return err
+	}
+	a.ifaces.Invalidate()
+	if a.core != nil {
+		a.core.ReloadIfRunning()
+	}
+	return nil
+}
+
+// splitCommaList 解析逗号分隔的配置项，忽略空项。
+func splitCommaList(raw string) []string {
+	out := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			out = append(out, trimmed)
 		}
 	}
-	return err
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (a *App) UpdateTUNConfig(cfg proxy.TUNConfig) error {
+	a.appendLog("[action] UpdateTUNConfig called")
+
+	old := a.ruleManager.GetTUNConfig()
+	if err := a.ruleManager.UpdateTUNConfig(cfg); err != nil {
+		return err
+	}
+	a.ifaces.Invalidate()
+
+	if a.core == nil {
+		return nil
+	}
+	if !a.core.GetTUNStatus().Running {
+		return nil
+	}
+	if old.Stack == cfg.Stack && old.AdapterName == cfg.AdapterName {
+		a.core.ReloadIfRunning()
+		return nil
+	}
+	a.appendLog("[action] UpdateTUNConfig: restarting TUN to apply stack / adapter changes")
+	if err := a.StopTUN(); err != nil {
+		a.appendLog("[warn] UpdateTUNConfig: StopTUN failed: " + err.Error())
+	}
+	return a.StartTUN()
 }
 
 func (a *App) GetTUNStatus() proxy.TUNStatus {
@@ -418,8 +404,58 @@ func (a *App) GetTUNStatus() proxy.TUNStatus {
 	}
 	return proxy.TUNStatus{
 		Running: false,
-		Message:   "core_service_not_running",
+		Message: "core_service_not_running",
 	}
+}
+
+func (a *App) GetNetworkInterfaces() []netiface.Descriptor {
+	cfg := a.ruleManager.GetTUNConfig()
+	descriptors := a.ifaces.List(cfg.InterfaceConfig())
+	a.appendLog(fmt.Sprintf("[action] GetNetworkInterfaces: %d interface(s) listed", len(descriptors)))
+	return descriptors
+}
+
+func (a *App) SetTUNInterface(name string) error {
+	cfg := a.ruleManager.GetTUNConfig()
+	selected := strings.TrimSpace(name)
+	a.appendLog(fmt.Sprintf("[action] SetTUNInterface called: %q", selected))
+
+	if selected != "" {
+		known := false
+		for _, descriptor := range a.ifaces.List(cfg.InterfaceConfig()) {
+			if strings.EqualFold(descriptor.Name, selected) || strconv.Itoa(descriptor.Index) == selected {
+				known = true
+				selected = descriptor.Name
+				break
+			}
+		}
+		if !known {
+			return fmt.Errorf("network interface not found: %s", selected)
+		}
+	}
+
+	if cfg.InterfaceName == selected {
+		return nil
+	}
+	cfg.InterfaceName = selected
+	if err := a.ruleManager.UpdateTUNConfig(cfg); err != nil {
+		return err
+	}
+	a.ifaces.Invalidate()
+
+	if a.core == nil {
+		return nil
+	}
+	if !a.core.GetTUNStatus().Running {
+		a.appendLog("[action] SetTUNInterface: TUN not running, config saved only")
+		return nil
+	}
+
+	a.appendLog("[action] SetTUNInterface: restarting TUN to apply the new outbound interface")
+	if err := a.StopTUN(); err != nil {
+		a.appendLog("[warn] SetTUNInterface: StopTUN failed: " + err.Error())
+	}
+	return a.StartTUN()
 }
 
 func (a *App) StartTUN() error {
@@ -431,13 +467,16 @@ func (a *App) StartTUN() error {
 
 	// Disable managed system proxy before TUN to avoid port/resource conflicts
 	status := a.GetSystemProxyStatus()
+	restoreSysProxy := false
 	if status.Enabled && a.isManagedSystemProxy(status) {
 		a.appendLog("[action] StartTUN: disabling managed system proxy before TUN")
 		if err := a.applySystemProxy(false, 0); err != nil {
 			a.appendLog("[warn] StartTUN: failed to disable system proxy: " + err.Error())
+		} else {
+			restoreSysProxy = true
 		}
-		a.tunRestoreSysProxy = true
 	}
+	a.setTUNRestoreSysProxy(restoreSysProxy)
 
 	captureEnabled := a.IsLogCaptureEnabled()
 
@@ -448,6 +487,15 @@ func (a *App) StartTUN() error {
 		}
 		if err != nil {
 			a.appendLog("[error] StartTUN failed: " + err.Error())
+			// 启动失败必须把系统代理还原回去：此前已为 TUN 关闭，
+			// 若不复原，用户会同时失去 TUN 与系统代理两条通路，表现为彻底断网。
+			// StartTUN 是异步 RPC，此处 err 为 nil 时仍需用实际状态复核。
+			if a.GetTUNStatus().Running {
+				a.restoreSysProxyAfterTUN()
+			} else {
+				a.appendLog("[warn] StartTUN: TUN not running, restoring managed system proxy")
+				a.restoreSysProxyAfterTUN()
+			}
 		}
 		a.emitFrontendState()
 	})
@@ -465,17 +513,33 @@ func (a *App) StopTUN() error {
 	}
 
 	// Restore system proxy if it was disabled for TUN
-	if a.tunRestoreSysProxy {
-		a.tunRestoreSysProxy = false
-		port := a.GetListenPort()
-		a.appendLog(fmt.Sprintf("[action] StopTUN: restoring managed system proxy on :%d", port))
-		if err2 := a.applySystemProxy(true, port); err2 != nil {
-			a.appendLog("[error] StopTUN: failed to restore system proxy: " + err2.Error())
-		}
-	}
+	a.restoreSysProxyAfterTUN()
 
 	a.emitFrontendState()
 	return err
+}
+
+func (a *App) setTUNRestoreSysProxy(value bool) {
+	a.tunSysProxyMu.Lock()
+	a.tunRestoreSysProxy = value
+	a.tunSysProxyMu.Unlock()
+}
+
+// restoreSysProxyAfterTUN 在 TUN 停止或启动失败后还原被临时关闭的系统代理。
+// 读改写必须持锁：tunRestoreSysProxy 同时被调用方与 StartTUN 的异步 goroutine 访问。
+func (a *App) restoreSysProxyAfterTUN() {
+	a.tunSysProxyMu.Lock()
+	shouldRestore := a.tunRestoreSysProxy
+	a.tunRestoreSysProxy = false
+	a.tunSysProxyMu.Unlock()
+	if !shouldRestore {
+		return
+	}
+	port := a.GetListenPort()
+	a.appendLog(fmt.Sprintf("[action] restoring managed system proxy on :%d", port))
+	if err := a.applySystemProxy(true, port); err != nil {
+		a.appendLog("[error] failed to restore system proxy: " + err.Error())
+	}
 }
 
 func (a *App) ExportCert() string {
@@ -498,7 +562,7 @@ func (a *App) ImportConfig(content string) error {
 	a.appendLog("[action] ImportConfig called")
 	err := a.ruleManager.ImportConfig(content)
 	if err == nil {
-		a.proxyServer.UpdateCloudflareConfig(a.ruleManager.GetCloudflareConfig())
+		a.proxyServer.UpdateCloudflareIPPool(a.ruleManager.GetCloudflareConfig().PreferredIPs)
 		if a.core != nil {
 			a.core.ReloadIfRunning()
 		}
@@ -511,7 +575,7 @@ func (a *App) ImportConfigWithSummary(content string) (proxy.ImportSummary, erro
 	a.appendLog("[action] ImportConfigWithSummary called")
 	summary, err := a.ruleManager.ImportConfigWithSummary(content)
 	if err == nil {
-		a.proxyServer.UpdateCloudflareConfig(a.ruleManager.GetCloudflareConfig())
+		a.proxyServer.UpdateCloudflareIPPool(a.ruleManager.GetCloudflareConfig().PreferredIPs)
 		if a.core != nil {
 			a.core.ReloadIfRunning()
 		}
@@ -577,6 +641,52 @@ func (a *App) UninstallCert(thumbprint string) error {
 	}
 	a.appendLog("[cert] UninstallCert succeeded: " + thumbprint)
 	return nil
+}
+
+// GetCore returns the underlying core RPC client (headless/CLI use).
+func (a *App) GetCore() *core.CoreClient {
+	return a.core
+}
+
+// GetActiveConnections 返回 core 进程的实时连接快照（有界注册表，
+// 最多 4096 条），供连接查看器轮询。core 未运行时返回空切片。
+func (a *App) GetActiveConnections() []proxy.ConnInfo {
+	if a.core == nil {
+		return []proxy.ConnInfo{}
+	}
+	return a.core.GetActiveConnections()
+}
+
+// ExplainMatch 用与真实连接完全相同的匹配管线模拟 host 的处理决策
+//（不产生路由事件）。全局模式取运行中的 core；process 为可选的
+// 进程名（per-app 规则模拟）。
+func (a *App) ExplainMatch(host, process string) proxy.MatchExplanation {
+	return a.ruleManager.ExplainMatch(host, a.GetProxyMode(), process)
+}
+
+// GetAppRecentLogs returns only the app-side in-memory log lines.
+func (a *App) GetAppRecentLogs(limit int) string {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	if a.logBuffer != nil {
+		lines := a.logBuffer.Snapshot(limit)
+		if len(lines) > 0 {
+			return strings.Join(lines, "\n")
+		}
+	}
+	return ""
+}
+
+// GetCoreRecentLogs returns only the core subprocess log lines.
+func (a *App) GetCoreRecentLogs(limit int) string {
+	if a.core != nil {
+		return a.core.GetRecentLogs(limit)
+	}
+	return ""
 }
 
 func (a *App) GetRecentLogs(limit int) string {
@@ -663,8 +773,7 @@ func (a *App) OpenLogFile(name string) {
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
-	cmd := exec.Command("cmd", "/c", "start", "", path)
-	if err := cmd.Run(); err != nil {
+	if err := common.OpenTarget(path); err != nil {
 		a.appendLog(fmt.Sprintf("[logs] Failed to open log file %s: %v", name, err))
 	}
 }
@@ -725,16 +834,36 @@ func (a *App) GetStats() core.StatsReply {
 	}
 }
 
-func (a *App) GetCACertPath() string {
-	if a.certManager == nil && a.certPath != "" {
+// setCertManager stores the cert manager under the protecting mutex; both the
+// startup hook and the lazy GUI path funnel through here.
+func (a *App) setCertManager(cm *certmanager.CertManager) {
+	a.certManagerMu.Lock()
+	a.certManager = cm
+	a.certManagerMu.Unlock()
+}
+
+// ensureCertManager lazily initializes the cert manager for bindings that can
+// run before the startup hook (or in config-only CLI commands). Concurrent
+// callers are serialized by certManagerMu, so the pointer write is race-free.
+func (a *App) ensureCertManager() {
+	a.certManagerMu.Lock()
+	defer a.certManagerMu.Unlock()
+	if a.certManager == nil {
 		if cm, err := certmanager.InitCertManager(a.certPath); err == nil {
 			a.certManager = cm
 		}
 	}
-	if a.certManager != nil {
-		return a.certManager.GetCACertPath()
+}
+
+func (a *App) GetCACertPath() string {
+	a.ensureCertManager()
+	a.certManagerMu.Lock()
+	cm := a.certManager
+	a.certManagerMu.Unlock()
+	if cm == nil {
+		return ""
 	}
-	return ""
+	return cm.GetCACertPath()
 }
 
 func (a *App) GetCACertPEM() string {
@@ -745,21 +874,18 @@ func (a *App) GetCACertPEM() string {
 }
 
 func (a *App) GetCAInstallStatus() CAInstallStatus {
-	if a.certManager == nil {
-		if a.certPath != "" {
-			if cm, err := certmanager.InitCertManager(a.certPath); err == nil {
-				a.certManager = cm
-			}
-		}
-	}
-	if a.certManager == nil {
+	a.ensureCertManager()
+	a.certManagerMu.Lock()
+	cm := a.certManager
+	a.certManagerMu.Unlock()
+	if cm == nil {
 		return CAInstallStatus{
 			CertPath:    a.certPath,
-			Platform:    "windows",
+			Platform:    runtime.GOOS,
 			InstallHelp: "证书状态初始化中",
 		}
 	}
-	status := a.certManager.GetCAInstallStatus()
+	status := cm.GetCAInstallStatus()
 	return CAInstallStatus{
 		Installed:   status.Installed,
 		Platform:    status.Platform,
@@ -843,6 +969,34 @@ func (a *App) DeleteUpstream(id string) error {
 	return err
 }
 
+// 分层规则（issue #172）：前端根据层级信息标注规则的来源，并只对
+// override/删除态提供"恢复为上游默认"操作。
+func (a *App) GetRulesLayerInfo() proxy.RulesLayerInfo {
+	return a.ruleManager.GetRulesLayerInfo()
+}
+
+func (a *App) RevertSiteGroupToUpstream(id string) error {
+	err := a.ruleManager.RevertSiteGroupToUpstream(id)
+	if err == nil {
+		a.appendLog(fmt.Sprintf("[action] site group %s reverted to upstream", id))
+		if a.core != nil {
+			a.core.ReloadIfRunning()
+		}
+	}
+	return err
+}
+
+func (a *App) RevertUpstreamConfigToUpstream(id string) error {
+	err := a.ruleManager.RevertUpstreamConfigToUpstream(id)
+	if err == nil {
+		a.appendLog(fmt.Sprintf("[action] upstream %s reverted to upstream default", id))
+		if a.core != nil {
+			a.core.ReloadIfRunning()
+		}
+	}
+	return err
+}
+
 func (a *App) GetCloudflareConfig() proxy.CloudflareConfig {
 	return a.ruleManager.GetCloudflareConfig()
 }
@@ -852,7 +1006,7 @@ func (a *App) UpdateCloudflareConfig(cfg proxy.CloudflareConfig) error {
 
 	err := a.ruleManager.UpdateCloudflareConfig(cfg)
 	if err == nil {
-		a.proxyServer.UpdateCloudflareConfig(cfg)
+		a.proxyServer.UpdateCloudflareIPPool(cfg.PreferredIPs)
 		if a.core != nil {
 			a.core.ReloadIfRunning()
 		}
@@ -926,6 +1080,131 @@ func (a *App) TriggerCFHealthCheck() error {
 	a.appendLog("[Cloudflare] Manual health check triggered...")
 	a.proxyServer.TriggerCFHealthCheck()
 	return nil
+}
+
+// GetIPPools returns the named IP pool configs (cloudfront, user-defined CDNs).
+func (a *App) GetIPPools() []proxy.IPPoolConfig {
+	return a.ruleManager.GetIPPoolsConfig()
+}
+
+// UpdateIPPools saves the full named-pool list and applies the diff to the
+// running proxy: added or changed pools get their IPs applied, removed pools
+// are dropped so their rules fall back to DNS dialing.
+func (a *App) UpdateIPPools(pools []proxy.IPPoolConfig) error {
+	old := a.ruleManager.GetIPPoolsConfig()
+	oldAutoUpdate := make(map[string]bool, len(old))
+	for _, pc := range old {
+		oldAutoUpdate[pc.Name] = pc.AutoUpdate
+	}
+
+	if err := a.ruleManager.UpdateIPPoolsConfig(pools); err != nil {
+		return err
+	}
+
+	current := make(map[string]bool, len(pools))
+	for _, pc := range pools {
+		current[pc.Name] = true
+	}
+	for _, pc := range old {
+		if !current[pc.Name] {
+			a.proxyServer.RemoveIPPool(pc.Name)
+		}
+	}
+	for _, pc := range a.ruleManager.GetIPPoolsConfig() {
+		a.proxyServer.UpdateIPPool(pc.Name, pc.PreferredIPs)
+		if pc.AutoUpdate && !oldAutoUpdate[pc.Name] {
+			go a.RefreshIPPool(pc.Name)
+		}
+	}
+	return nil
+}
+
+// GetIPPoolStats returns every IP of the named pool with its health stats.
+func (a *App) GetIPPoolStats(name string) []*cfpool.IPStats {
+	return a.proxyServer.GetIPPoolStats(name)
+}
+
+// ForceFetchIPPoolIPs pulls fresh preferred IPs for the named pool from its
+// CDN source (manual action, ignores AutoUpdate).
+func (a *App) ForceFetchIPPoolIPs(name string) error {
+	return a.fetchIPPool(name, true)
+}
+
+// RefreshIPPool fetches fresh IPs when the pool is stale or empty and its
+// AutoUpdate flag is on.
+func (a *App) RefreshIPPool(name string) {
+	pools := a.ruleManager.GetIPPoolsConfig()
+	for _, pc := range pools {
+		if pc.Name == name {
+			if pc.AutoUpdate {
+				_ = a.fetchIPPool(name, false)
+			}
+			return
+		}
+	}
+}
+
+func (a *App) fetchIPPool(name string, force bool) error {
+	pool := a.proxyServer.GetIPPool(name)
+	if !force {
+		if pool != nil && pool.HasIPs() && !pool.IsStale(24*time.Hour) {
+			return nil
+		}
+	}
+
+	var cfg *proxy.IPPoolConfig
+	for _, pc := range a.ruleManager.GetIPPoolsConfig() {
+		if pc.Name == name {
+			c := pc
+			cfg = &c
+			break
+		}
+	}
+	if cfg == nil {
+		return fmt.Errorf("IP pool %q not found", name)
+	}
+
+	ips, err := cfpool.FetchCDNIPs(name, cfg.APIKey)
+	if err != nil {
+		a.appendLog(fmt.Sprintf("[error] IP pool %s fetch failed: %s", name, err.Error()))
+		return err
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("IP pool %s: source returned no IPs", name)
+	}
+
+	a.appendLog(fmt.Sprintf("[success] IP pool %s: fetched %d preferred IPs", name, len(ips)))
+	a.proxyServer.UpdateIPPool(name, ips)
+	a.proxyServer.SetIPPoolFetchTime(name, time.Now())
+	cfg.PreferredIPs = ips
+	return a.saveIPPoolConfig(*cfg)
+}
+
+// saveIPPoolConfig upserts a single named pool into the persisted list.
+func (a *App) saveIPPoolConfig(cfg proxy.IPPoolConfig) error {
+	pools := a.ruleManager.GetIPPoolsConfig()
+	found := false
+	for i, pc := range pools {
+		if pc.Name == cfg.Name {
+			pools[i] = cfg
+			found = true
+			break
+		}
+	}
+	if !found {
+		pools = append(pools, cfg)
+	}
+	return a.ruleManager.UpdateIPPoolsConfig(pools)
+}
+
+// RemoveInvalidIPPoolIPs drops failed IPs from the named pool.
+func (a *App) RemoveInvalidIPPoolIPs(name string) int {
+	return a.proxyServer.RemoveInvalidIPPoolIPs(name)
+}
+
+// TriggerIPPoolHealthCheck starts an immediate health-check pass on the named pool.
+func (a *App) TriggerIPPoolHealthCheck(name string) {
+	a.proxyServer.TriggerIPPoolHealthCheck(name)
 }
 
 func (a *App) GetECHProfiles() []proxy.ECHProfile {
@@ -1006,9 +1285,9 @@ func (a *App) SetDNSNodePriority(id string, targetIndex int) error {
 }
 
 type DNSNodeTestResult struct {
-	Success bool   `json:"success"`
-	Latency int64  `json:"latency"`
-	Error   string `json:"error,omitempty"`
+	Success bool     `json:"success"`
+	Latency int64    `json:"latency"`
+	Error   string   `json:"error,omitempty"`
 	IPs     []string `json:"ips,omitempty"`
 }
 
@@ -1082,20 +1361,6 @@ func (a *App) GetAutoRoutingStatus() proxy.GFWListStatus {
 	return a.ruleManager.GetAutoRoutingStatus()
 }
 
-func (a *App) RefreshGFWList() error {
-	a.appendLog("[action] RefreshGFWList called")
-	_, err := a.ruleManager.RefreshGFWList()
-	if err != nil {
-		a.appendLog("[error] RefreshGFWList failed: " + err.Error())
-	} else {
-		a.appendLog("[action] RefreshGFWList success")
-		if a.core != nil {
-			a.core.ReloadIfRunning()
-		}
-	}
-	return err
-}
-
 func (a *App) GetAppVersion() string {
 	if strings.TrimSpace(buildVersion) != "" {
 		return buildVersion
@@ -1150,10 +1415,7 @@ func (a *App) OpenURL(rawURL string) {
 		a.appendLog(fmt.Sprintf("[update] Invalid or unsupported URL: %s", rawURL))
 		return
 	}
-	cmd := exec.Command("cmd", "/c", "start", parsed.String())
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := common.OpenTarget(parsed.String()); err != nil {
 		a.appendLog(fmt.Sprintf("[update] Failed to open URL: %v", err))
 	}
 }
@@ -1161,12 +1423,8 @@ func (a *App) OpenURL(rawURL string) {
 func (a *App) QuitApp() {
 	a.shouldQuit = true
 	a.shutdown()
-	if a.mainWindow != nil {
-		a.mainWindow.Close()
-	}
-	if a.wailsApp != nil {
-		a.wailsApp.Quit()
-	}
+	a.closeMainWindow()
+	a.quitAppUI()
 }
 
 func (a *App) waitForProxyListen(addr string, timeout time.Duration) error {
@@ -1247,7 +1505,7 @@ func (a *App) TestNAT64Profile(prefix string) (int64, error) {
 	var mappedIP string
 	for _, ip := range ips {
 		if ip.To4() != nil {
-			mapped, ok := mapNAT64AddrForTest(ip.String(), prefix)
+			mapped, ok := common.MapNAT64Addr(ip.String(), prefix)
 			if ok {
 				mappedIP = mapped
 				break
@@ -1271,41 +1529,15 @@ func (a *App) TestNAT64Profile(prefix string) (int64, error) {
 	return time.Since(start).Milliseconds(), nil
 }
 
-func mapNAT64AddrForTest(ipStr string, prefix string) (string, bool) {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return ipStr, true
-	}
-	parsedIP := net.ParseIP(ipStr)
-	if parsedIP == nil {
-		return ipStr, true
-	}
-	ipv4 := parsedIP.To4()
-	if ipv4 == nil {
-		return ipStr, false
-	}
-
-	var prefixIP net.IP
-	if strings.Contains(prefix, "/") {
-		_, ipnet, err := net.ParseCIDR(prefix)
-		if err == nil && ipnet != nil {
-			prefixIP = ipnet.IP
-		}
-	} else {
-		prefixIP = net.ParseIP(prefix)
-	}
-
-	if prefixIP == nil || len(prefixIP) != 16 {
-		return ipStr, true
-	}
-	mappedIP := make(net.IP, 16)
-	copy(mappedIP, prefixIP[:12])
-	copy(mappedIP[12:], ipv4)
-	return mappedIP.String(), true
-}
-
 func (a *App) GetMigrationEnabled() bool {
 	return a.ruleManager.GetMigrationEnabled()
+}
+
+// GetLastMigrationReport 返回启动加载配置时产生的迁移/校验报告
+// （版本迁移、字段修复、备份路径；Errors 非空表示配置无法安全迁移）。
+// 与 GetMigrationEnabled 的「会话迁移代理模式」无关。
+func (a *App) GetLastMigrationReport() proxy.MigrationReport {
+	return a.startupMigrationReport
 }
 
 func (a *App) SetMigrationEnabled(enabled bool) error {
@@ -1334,7 +1566,10 @@ func (a *App) TestMigration(server string) (string, error) {
 	apiURL := fmt.Sprintf("%s?target=%s&ip=1.1.1.1", server, testTarget)
 	a.appendLog(fmt.Sprintf("[Migration] GET %s", apiURL))
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{Proxy: sysproxy.UpstreamProxyFunc()},
+	}
 	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return "", err

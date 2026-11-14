@@ -1,15 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useDeferredValue } from 'react';
 import {
-  FileText, Trash2, Pause, Play, Search, ChevronsUp, Radio, ArrowDown, Download
+  FileText, Delete, Pause, Play, Search, ChevronsUp, Antenna, ArrowDown, Download, X, Save
 } from '../lib/icons';
 import {
   ClearLogs, GetRecentLogs, IsLogCaptureEnabled,
-  StartLogCapture, StopLogCapture
+  StartLogCapture, StopLogCapture,
+  PreviewDiagnosticsExport, ExportDiagnostics, RevealDiagnosticsExport
 } from '../api/bindings';
 import { useTranslation } from '../i18n/I18nContext';
-import { Box, Typography, Button, TextField, InputAdornment } from '@mui/material';
+import { Box, Typography, Button, TextField, InputAdornment, IconButton, Chip } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import { keyframes } from '@emotion/react';
+import Modal from '../components/Modal';
+import { toast } from '../lib/toast';
 
 const RE_ERROR = /error|failed|panic/i;
 const RE_WARN = /warn/i;
@@ -30,6 +33,7 @@ const bounce = keyframes`0%,100%{transform:translateY(0)}50%{transform:translate
 
 const LogLine: React.FC<{ line: string }> = React.memo(({ line }) => {
   const { time, msg, level } = parseLine(line);
+  const { t } = useTranslation();
 
   const levelColor = level === 'error' ? 'error.main' : level === 'warn' ? 'warning.main' : 'text.primary';
   const borderColor = level === 'error' ? 'rgba(239,68,68,0.7)' : level === 'warn' ? 'rgba(245,158,11,0.7)' : 'transparent';
@@ -39,7 +43,7 @@ const LogLine: React.FC<{ line: string }> = React.memo(({ line }) => {
 
   return (
     <Box sx={{
-      display: 'flex', gap: 1.5, px: 2.5, py: 1, fontFamily: 'monospace', fontSize: '0.75rem', lineHeight: 1.75,
+      display: 'flex', gap: 1.5, px: 2.5, py: 1, fontSize: '0.75rem', lineHeight: 1.75,
       borderLeft: 3, borderLeftColor: borderColor, bgcolor: bgColor, color: levelColor,
       transition: 'background-color 0.15s', '&:hover': { bgcolor: 'action.hover' },
     }}>
@@ -48,7 +52,7 @@ const LogLine: React.FC<{ line: string }> = React.memo(({ line }) => {
         flexShrink: 0, px: 0.75, borderRadius: 0.5, fontSize: '0.625rem', fontWeight: 900, textTransform: 'uppercase',
         lineHeight: '18px', height: 18, textAlign: 'center', minWidth: 38, bgcolor: badgeBg, color: badgeColor,
       }}>
-        {level === 'error' ? 'ERR' : level === 'warn' ? 'WRN' : 'INF'}
+        {level === 'error' ? t('logs.level_error') : level === 'warn' ? t('logs.level_warn') : t('logs.level_info')}
       </Box>
       <Box component="span" sx={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', '&:hover': { whiteSpace: 'normal', wordBreak: 'break-all' } }}>{msg}</Box>
     </Box>
@@ -147,6 +151,53 @@ const Logs: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  // ---- Diagnostic export: preview first, then export the sanitized zip ----
+  const [diagPreview, setDiagPreview] = useState<any>(null);
+  const [isDiagOpen, setIsDiagOpen] = useState(false);
+  const [isDiagExporting, setIsDiagExporting] = useState(false);
+
+  const openDiagPreview = async () => {
+    try {
+      const preview = await PreviewDiagnosticsExport();
+      setDiagPreview(preview);
+      setIsDiagOpen(true);
+    } catch {
+      toast.error(t('logs.diag_failed'));
+    }
+  };
+
+  const formatSize = (n: number): string => {
+    if (!Number.isFinite(n) || n <= 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+  };
+
+  const redactedFieldLabels: Record<string, string> = {
+    api_key: t('logs.diag_redacted_api_key'),
+    url_credentials: t('logs.diag_redacted_url_credentials'),
+    query_token: t('logs.diag_redacted_query_token'),
+    bearer: t('logs.diag_redacted_bearer'),
+  };
+
+  const handleDiagExport = async () => {
+    if (isDiagExporting) return;
+    setIsDiagExporting(true);
+    try {
+      const path = await ExportDiagnostics();
+      setIsDiagOpen(false);
+      if (typeof path === 'string' && path) {
+        RevealDiagnosticsExport(path);
+        toast.success(t('logs.diag_success'), path);
+      } else {
+        toast.error(t('logs.diag_failed'));
+      }
+    } catch {
+      toast.error(t('logs.diag_failed'));
+    }
+    setIsDiagExporting(false);
+  };
+
   const renderedContent = useMemo(() => {
     if (!captureEnabled || filteredLines.length === 0) return null;
     let lastDate = '';
@@ -181,7 +232,7 @@ const Logs: React.FC = () => {
         </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button onClick={handleToggleCapture} loading={isTogglingCapture}
-            color={captureEnabled ? 'error' : 'primary'} variant="contained" size="small" startIcon={<Radio size={14} />}>
+            color={captureEnabled ? 'error' : 'primary'} variant="contained" size="small" startIcon={<Antenna size={14} />}>
             {captureEnabled ? t('logs.stop_capture') : t('logs.capture')}
           </Button>
           <Button onClick={() => setIsPaused(!isPaused)} disabled={!captureEnabled}
@@ -192,36 +243,51 @@ const Logs: React.FC = () => {
             {t('logs.scroll_top')}
           </Button>
           <Button onClick={handleClear} variant="outlined" size="small"
-            sx={{ '&:hover': { bgcolor: 'rgba(239,68,68,0.1)', color: 'error.main' } }} startIcon={<Trash2 size={14} />}>
+            sx={{ '&:hover': { bgcolor: 'rgba(239,68,68,0.1)', color: 'error.main' } }} startIcon={<Delete size={14} />}>
             {t('logs.clear')}
           </Button>
           <Button onClick={handleExport} disabled={!captureEnabled || filteredLines.length === 0}
             variant="outlined" size="small" startIcon={<Download size={14} />}>
             {t('logs.export')}
           </Button>
+          <Button onClick={openDiagPreview} variant="outlined" size="small" startIcon={<Save size={14} />}>
+            {t('logs.diag_button')}
+          </Button>
         </Box>
       </Box>
 
       <Box sx={{ mb: 2.5, flexShrink: 0 }}>
-        <TextField
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder={t('logs.search_placeholder')}
-          aria-label={t('logs.search_placeholder')}
-          fullWidth
-          size="small"
-          slotProps={{
-            input: {
-              startAdornment: (
-                <InputAdornment position="start">
-                  <Search size={16} aria-hidden />
-                </InputAdornment>
-              ),
-            },
-          }}
-          sx={{ '& .MuiOutlinedInput-root': { borderRadius: 2, bgcolor: 'background.paper' } }}
-        />
+		<TextField
+		  type="text"
+		  value={search}
+		  onChange={(e) => setSearch(e.target.value)}
+		  placeholder={t('logs.search_placeholder')}
+		  aria-label={t('logs.search_placeholder')}
+		  fullWidth
+		  size="small"
+		  slotProps={{
+			input: {
+			  startAdornment: (
+				<InputAdornment position="start">
+				  <Search size={16} aria-hidden />
+				</InputAdornment>
+			  ),
+			  endAdornment: search ? (
+				<InputAdornment position="end">
+				  <IconButton
+					size="small"
+					onClick={() => setSearch('')}
+					aria-label={t('common.clear')}
+					edge="end"
+				  >
+					<X size={14} />
+				  </IconButton>
+				</InputAdornment>
+			  ) : null,
+			},
+		  }}
+		  sx={{ '& .MuiOutlinedInput-root': { borderRadius: 2, bgcolor: 'background.paper' } }}
+		/>
       </Box>
 
       <Box ref={scrollRef} onScroll={handleScroll} sx={{
@@ -232,7 +298,7 @@ const Logs: React.FC = () => {
         <Box sx={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>
           {!captureEnabled ? (
             <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'text.secondary', opacity: 0.6, px: 4, textAlign: 'center' }}>
-              <Radio size={42} strokeWidth={1.5} aria-hidden />
+              <Antenna size={42} strokeWidth={1.5} aria-hidden />
               <Typography variant="caption" sx={{ mt: 2, fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.2em', fontSize: '0.75rem' }}>{t('logs.capture_disabled')}</Typography>
               <Typography variant="caption" sx={{ mt: 1.5, lineHeight: 1.6, maxWidth: 448, display: 'block' }}>{t('logs.capture_hint')}</Typography>
             </Box>
@@ -278,6 +344,49 @@ const Logs: React.FC = () => {
           )}
         </Box>
       </Box>
+
+      <Modal
+        isOpen={isDiagOpen}
+        onClose={() => setIsDiagOpen(false)}
+        title={t('logs.diag_title')}
+        subtitle={t('logs.diag_hint')}
+        maxWidth="30rem"
+        footer={<>
+          <Button type="button" onClick={() => setIsDiagOpen(false)} variant="outlined" size="small">{t('common.cancel')}</Button>
+          <Button type="button" onClick={handleDiagExport} variant="contained" color="primary" size="small" disabled={isDiagExporting}>
+            {isDiagExporting ? t('logs.diag_exporting') : t('logs.diag_export')}
+          </Button>
+        </>}
+      >
+        {diagPreview && (
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <Box>
+              <Typography variant="caption" sx={{ fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.1em' }} color="text.secondary">
+                {t('logs.diag_files_title')}
+              </Typography>
+              <Box sx={{ mt: 1, display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                {(diagPreview.files || []).map((f: any) => (
+                  <Box key={f.name} sx={{ display: 'flex', gap: 1.5, alignItems: 'baseline', fontSize: '0.8rem' }}>
+                    <Box component="span" sx={{ fontWeight: 700, fontFamily: 'monospace' }}>{f.name}</Box>
+                    <Box component="span" sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}>{formatSize(f.size || 0)}</Box>
+                    <Box component="span" sx={{ color: 'text.secondary', ml: 'auto', textAlign: 'right' }}>{f.description}</Box>
+                  </Box>
+                ))}
+              </Box>
+            </Box>
+            <Box>
+              <Typography variant="caption" sx={{ fontWeight: 900, textTransform: 'uppercase', letterSpacing: '0.1em' }} color="text.secondary">
+                {t('logs.diag_redacted_title')}
+              </Typography>
+              <Box sx={{ mt: 1, display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+                {(diagPreview.redacted_fields || []).map((k: string) => (
+                  <Chip key={k} size="small" label={redactedFieldLabels[k] || k} variant="outlined" sx={{ height: 22, fontSize: '0.7rem' }} />
+                ))}
+              </Box>
+            </Box>
+          </Box>
+        )}
+      </Modal>
     </Box>
   );
 };

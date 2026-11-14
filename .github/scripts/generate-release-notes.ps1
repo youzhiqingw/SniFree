@@ -8,10 +8,19 @@ param(
     [Parameter(Mandatory = $false)][string]$OllamaUrl = "http://127.0.0.1:11434",
     [Parameter(Mandatory = $false)][string]$OllamaModel = "qwen3.5:2b",
     [Parameter(Mandatory = $false)][string]$LlmApiKey = "",
-    [Parameter(Mandatory = $false)][string]$LlmModel = "gpt-4o-mini",
-    [Parameter(Mandatory = $false)][string]$LlmBaseUrl = "https://api.openai.com/v1",
-    [Parameter(Mandatory = $false)][int]$LlmMaxCommits = 400
+    [Parameter(Mandatory = $false)][ValidateSet('external', 'ollama')][string]$LlmPriority = "external",
+    [Parameter(Mandatory = $false)][string]$LlmModel = "poolside/laguna-xs-2.1",
+    [Parameter(Mandatory = $false)][string]$LlmBaseUrl = "https://integrate.api.nvidia.com/v1",
+    [Parameter(Mandatory = $false)][int]$LlmMaxTokens = 2000,
+    [Parameter(Mandatory = $false)][int]$LlmMaxCommits = 80
 )
+
+if (-not $LlmApiKey -and $env:LLM_API_KEY) { $LlmApiKey = $env:LLM_API_KEY }
+if (-not $PSBoundParameters.ContainsKey('LlmModel') -and $env:LLM_MODEL) { $LlmModel = $env:LLM_MODEL }
+if (-not $PSBoundParameters.ContainsKey('LlmBaseUrl') -and $env:LLM_BASE_URL) { $LlmBaseUrl = $env:LLM_BASE_URL }
+if (-not $PSBoundParameters.ContainsKey('LlmPriority') -and $env:LLM_PRIORITY -in @('external', 'ollama')) { $LlmPriority = $env:LLM_PRIORITY }
+if (-not $PSBoundParameters.ContainsKey('OllamaModel') -and $env:OLLAMA_MODEL) { $OllamaModel = $env:OLLAMA_MODEL }
+if (-not $PSBoundParameters.ContainsKey('OllamaUrl') -and $env:OLLAMA_URL) { $OllamaUrl = $env:OLLAMA_URL }
 
 $ErrorActionPreference = 'Stop'
 try {
@@ -53,6 +62,40 @@ if ($LASTEXITCODE -ne 0) {
 
 $lines = ($gitLog | Out-String) -split "`r?`n"
 
+function Get-CommitGroup {
+    param([string]$Subject)
+    if ($Subject -match '^feat(\(.+\))?:') { return 'feat' }
+    if ($Subject -match '^fix(\(.+\))?:') { return 'fix' }
+    if ($Subject -match '^perf(\(.+\))?:') { return 'perf' }
+    if ($Subject -match '^refactor(\(.+\))?:') { return 'refactor' }
+    if ($Subject -match '^docs(\(.+\))?:') { return 'docs' }
+    if ($Subject -match '^(build|ci)(\(.+\))?:') { return 'build' }
+    if ($Subject -match '^test(\(.+\))?:') { return 'test' }
+    return 'other'
+}
+
+function Test-SummaryShape {
+    param([string]$Text)
+    $reason = $null
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        $reason = 'empty output'
+    } else {
+        $body = (($Text -split "`n") | Where-Object { $_ -notmatch '^\s*#{1,6}\s' }) -join "`n"
+        $bodyLen = $body.Trim().Length
+        $headings = ([regex]::Matches($Text, '(?m)^#{2,3} \S')).Count
+        $items = ([regex]::Matches($Text, '(?m)^\s*(?:[-*\u2022]|\d+[.)])\s+\S')).Count
+        if ($headings -lt 1) { $reason = 'no Markdown category heading' }
+        elseif ($bodyLen -lt 200) { $reason = "content too short ($bodyLen chars after headings)" }
+        elseif ($items -gt 60) { $reason = "$items list items exceed the 60 limit" }
+    }
+    if (-not $reason) { return $true }
+    Write-Host "::warning::summary rejected: $reason"
+    $head = $Text -replace '\s+', ' '
+    if ($head.Length -gt 300) { $head = $head.Substring(0, 300) }
+    Write-Host "[release-notes] Rejected output head: $head"
+    return $false
+}
+
 $groups = @{
     feat     = @()
     fix      = @()
@@ -63,42 +106,60 @@ $groups = @{
     test     = @()
     other    = @()
 }
-$authors = @{}
 $totalCommits = 0
 $commitList = @()
 
 foreach ($line in $lines) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $parts = $line -split "`t"
+    $parts = @($line -split "`t")
     if ($parts.Count -lt 4) { continue }
     $hash = $parts[0]
-    $subject = $parts[1]
-    $author = $parts[2]
-    $email = $parts[3]
+    # The last two fields are the author name and email; a commit subject may
+    # itself contain tabs, so everything between belongs to the subject.
+    $subject = (($parts[1..($parts.Count - 3)]) -join ' ').Trim()
     $totalCommits++
 
-    $key = 'other'
-    if ($subject -match '^feat(\(.+\))?:') { $key = 'feat' }
-    elseif ($subject -match '^fix(\(.+\))?:') { $key = 'fix' }
-    elseif ($subject -match '^docs(\(.+\))?:') { $key = 'docs' }
-    elseif ($subject -match '^refactor(\(.+\))?:') { $key = 'refactor' }
-    elseif ($subject -match '^perf(\(.+\))?:') { $key = 'perf' }
-    elseif ($subject -match '^(build|ci)(\(.+\))?:') { $key = 'build' }
-    elseif ($subject -match '^test(\(.+\))?:') { $key = 'test' }
+    $key = Get-CommitGroup -Subject $subject
 
     $groups[$key] += [PSCustomObject]@{ Hash = $hash; Subject = $subject }
     $commitList += [PSCustomObject]@{ Hash = $hash; Subject = $subject }
-    if (-not $authors.ContainsKey($email)) {
-        $authors[$email] = @{ Name = $author; Count = 0 }
-    }
-    $authors[$email].Count++
 }
 
 # ---------- LLM summarization (Ollama first, then external API) ----------
 $llmSummary = $null
 
-$batch = $commitList | Select-Object -First $LlmMaxCommits
-$commitText = ($batch | ForEach-Object { "- $($_.Hash) $($_.Subject)" }) -join "`n"
+$noisePattern = '^(Merge |Bump |chore\(deps|chore\(dependabot)'
+$categoryOrder = @('feat', 'fix', 'perf', 'refactor', 'docs', 'build', 'test', 'other')
+$categoryCaps = @{ feat = 12; fix = 15; perf = 6; refactor = 8; docs = 4; build = 6; test = 3; other = 10 }
+$seenSubjects = @{}
+$digestBuckets = @{}
+foreach ($k in $categoryOrder) { $digestBuckets[$k] = @() }
+$droppedNoise = 0
+$droppedDuplicate = 0
+foreach ($c in $commitList) {
+    if ($c.Subject -match $noisePattern) { $droppedNoise++; continue }
+    $norm = $c.Subject.Trim().ToLowerInvariant()
+    if ($seenSubjects.ContainsKey($norm)) { $droppedDuplicate++; continue }
+    $seenSubjects[$norm] = $true
+    $digestBuckets[(Get-CommitGroup -Subject $c.Subject)] += $c.Subject
+}
+
+$digestLines = @()
+$budget = $LlmMaxCommits
+$fedCount = 0
+foreach ($k in $categoryOrder) {
+    $items = $digestBuckets[$k]
+    if ($items.Count -eq 0) { continue }
+    if ($budget -le 0) { continue }
+    $take = [Math]::Min($items.Count, [int]$categoryCaps[$k])
+    if ($take -gt $budget) { $take = $budget }
+    $digestLines += "### $k ($($items.Count))"
+    foreach ($s in ($items | Select-Object -First $take)) { $digestLines += "- $s" }
+    $budget -= $take
+    $fedCount += $take
+}
+$commitText = $digestLines -join "`n"
+Write-Host "[release-notes] LLM input: $totalCommits commits -> $fedCount selected ($($digestLines.Count - $fedCount) group headings); dropped $droppedNoise automated/merge and $droppedDuplicate duplicate subject(s)"
 
 $systemPrompt = @"
 You are a senior technical writer producing formal, rigorous English release notes for an open-source software project.
@@ -115,6 +176,13 @@ Writing requirements:
 4. Strictly forbid any emoji or emoticons. Do not output commit hashes.
 5. Output only the release-notes body. No preamble, postscript, or explanatory text.
 
+Hard limits (violating these makes the notes unusable):
+6. Use three to six bullet points per section and never exceed eight in one section.
+7. The first line MUST be a Markdown heading (### ...). Never open with a sentence such as "Here is ...", a greeting, or any other preamble.
+8. Rewrite each change as a user-facing statement. Never copy a commit subject verbatim and never emit a raw list of commit titles.
+9. Skip sections that have no changes.
+10. Every section MUST contain at least two bullet lines starting with "- ". Do not write long prose paragraphs.
+
 Expected output shape (English only):
 ### New Features
 - Feature A: what it does and its impact.
@@ -124,7 +192,9 @@ Expected output shape (English only):
 "@
 
 $userPrompt = @"
-Write the official English release notes for this version of SniShaper (a Windows local proxy tool), based on the commit message list below.
+Write the official English release notes for this version of SniShaper (a Windows local proxy tool), based on the grouped change list below.
+
+The list is pre-grouped by conventional-commit type: feat = New Features, fix = Bug Fixes, perf = Performance Improvements, refactor = Refactoring, docs = Documentation, build = Build & CI, test = Tests, other = Other. Automated dependency bumps and merge commits have already been removed, so every entry is a real change. The number in each heading is the total count for that type; only a representative subset is listed.
 
 LANGUAGE CONSTRAINT (highest priority):
 - The ENTIRE output MUST be entirely in English. Do not use Chinese or any other language anywhere in the output.
@@ -132,90 +202,147 @@ LANGUAGE CONSTRAINT (highest priority):
 
 Writing requirements:
 1. Organize the content by change type, e.g.: New Features, Bug Fixes, Performance Improvements, Refactoring, Documentation, Build & CI, Tests, Other.
-2. For each type, describe the core changes in detail: what was modified, why, and the impact on users or the system. Use one or more concise bullet points per item.
+2. For each type, describe the core changes in detail: what was modified, why, and the impact on users or the system. Use three to six concise bullet points per section, at most eight.
 3. If a change touches multiple modules (proxy core, TUN, frontend UI, build scripts, etc.), break them out per module.
 4. Minor changes such as dependency bumps, formatting, or merges may be condensed into a single brief note.
-5. Write in formal, rigorous English. Strictly forbid emoji. Do not output commit hashes.
+5. Write in formal, rigorous English. Strictly forbid emoji. Do not output commit hashes, and do not copy commit subjects verbatim.
 
-Commit log:
+Grouped change list:
 $commitText
 "@
 
-# --- Priority 1: local Ollama ---
-$ollamaAvailable = $false
-try {
-    Write-Host "[release-notes] Checking Ollama at $OllamaUrl"
-    $tagsResp = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -Method Get -TimeoutSec 10
-    $ollamaAvailable = $true
-    Write-Host "[release-notes] Ollama reachable, installed models: $($tagsResp.models.model -join ', ')"
-} catch {
-    Write-Host "::warning::Ollama not available ($($_.Exception.Message))"
+# --- Preferred: OpenAI-compatible API (Zhipu GLM by default) ---
+$hasApiKey = -not [string]::IsNullOrEmpty($LlmApiKey)
+$useExternal = ($LlmPriority -eq 'external') -and $hasApiKey
+$useOllama = -not $useExternal
+
+if ($LlmPriority -eq 'external' -and -not $hasApiKey) {
+    Write-Host "[release-notes] LLM_API_KEY not set; using the local Ollama model instead"
 }
 
-if ($ollamaAvailable) {
-    Write-Host "[release-notes] Generating summary via local Ollama model=$OllamaModel"
-    $ollamaBody = @{
-        model    = $OllamaModel
-        messages = @(
-            @{ role = 'system'; content = $systemPrompt },
-            @{ role = 'user'; content = $userPrompt }
-        )
-        stream   = $false
-        # Qwen3+ models enable thinking mode by default; the reasoning
-        # goes into message.thinking while message.content stays empty.
-        # Disable it so the final answer is returned in message.content.
-        think    = $false
-    } | ConvertTo-Json -Depth 6
-    try {
-        $resp = Invoke-RestMethod -Uri "$OllamaUrl/api/chat" -Method Post -ContentType 'application/json; charset=utf-8' -Body $ollamaBody -TimeoutSec 300
-        if ($resp.message -and $resp.message.content) {
-            $llmSummary = $resp.message.content.Trim()
-            Write-Host "[release-notes] Ollama summary generated ($($llmSummary.Length) chars)"
-        } elseif ($resp.message -and $resp.message.thinking) {
-            # thinking present but no final content - treat as failure
-            Write-Host "::warning::Ollama returned thinking but empty content (model=$OllamaModel). Falling back."
-        } else {
-            Write-Host "::warning::Ollama returned empty response (model=$OllamaModel). Falling back."
-        }
-    } catch {
-        Write-Host "::warning::Ollama inference failed: $($_.Exception.Message)"
-    }
-}
-
-# --- Priority 2: external OpenAI-compatible API ---
-if (-not $llmSummary -and -not [string]::IsNullOrEmpty($LlmApiKey)) {
-    Write-Host "[release-notes] LLM summarization via external API (model=$LlmModel, base=$LlmBaseUrl, commits=$($commitList.Count))"
+if ($useExternal) {
+    Write-Host "[release-notes] LLM summarization via API (model=$LlmModel, base=$LlmBaseUrl, commits=$fedCount)"
     $body = @{
-        model    = $LlmModel
-        messages = @(
+        model       = $LlmModel
+        messages    = @(
             @{ role = 'system'; content = $systemPrompt },
             @{ role = 'user'; content = $userPrompt }
         )
         temperature = 0.3
-    } | ConvertTo-Json -Depth 6
+        max_tokens  = $LlmMaxTokens
+    }
+    if ($LlmBaseUrl -match 'bigmodel\.cn') {
+        $body.thinking = @{ type = 'disabled' }
+    }
+    $bodyJson = $body | ConvertTo-Json -Depth 6
 
+    $uri = $LlmBaseUrl.TrimEnd('/')
+    if (-not $uri.EndsWith('/chat/completions')) {
+        $uri += '/chat/completions'
+    }
+    $headers = @{ Authorization = "Bearer $LlmApiKey" }
+    Write-Host "[release-notes] POST $uri"
+
+    $maxAttempts = 6
+    $attemptTimeout = 150
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bodyJson -TimeoutSec $attemptTimeout
+            $content = $null
+            $reasoning = $null
+            $finish = $null
+            if ($resp.choices -and $resp.choices.Count -gt 0 -and $resp.choices[0].message) {
+                $content = $resp.choices[0].message.content
+                $reasoning = $resp.choices[0].message.reasoning_content
+                $finish = $resp.choices[0].finish_reason
+            }
+            if (-not $content -and $reasoning) {
+                Write-Host "::warning::API returned reasoning but empty content (model=$LlmModel, finish=$finish, reasoning=$($reasoning.Length) chars, max_tokens=$LlmMaxTokens). Falling back."
+            } elseif (-not $content) {
+                Write-Host "::warning::API response missing content (model=$LlmModel, finish=$finish). Falling back."
+            } else {
+                $candidate = $content.Trim()
+                if (Test-SummaryShape -Text $candidate) {
+                    $llmSummary = $candidate
+                    Write-Host "[release-notes] LLM summary generated ($($llmSummary.Length) chars, shape check passed, attempt $attempt, finish=$finish)"
+                } else {
+                    Write-Host "::warning::LLM summary failed the shape check (model=$LlmModel, finish=$finish). Falling back to categorized list."
+                }
+            }
+            break
+        } catch {
+            $status = 0
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            $detail = ''
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+            $detail = ($detail -replace '\s+', ' ').Trim()
+            if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) }
+            Write-Host "::warning::LLM request failed (attempt $attempt/$maxAttempts, status $status): $($_.Exception.Message)"
+            if ($detail) { Write-Host "[release-notes] API error body: $detail" }
+            $llmSummary = $null
+            if (($status -eq 0 -or $status -eq 429 -or $status -ge 500) -and $attempt -lt $maxAttempts) {
+                $backoff = [Math]::Min(60, 10 * [Math]::Pow(2, $attempt - 1))
+                $wait = [Math]::Max(5, [int]$backoff + (Get-Random -Minimum -3 -Maximum 4))
+                Write-Host "[release-notes] Retrying in ${wait}s (status $status, attempt $attempt/$maxAttempts)"
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            break
+        }
+    }
+}
+
+# --- Fallback: local Ollama ---
+if (-not $llmSummary -and $useOllama) {
+    $ollamaAvailable = $false
     try {
-        $uri = $LlmBaseUrl.TrimEnd('/')
-        if (-not $uri.EndsWith('/chat/completions')) {
-            $uri += '/chat/completions'
-        }
-        $headers = @{ Authorization = "Bearer $LlmApiKey" }
-        Write-Host "[release-notes] POST $uri"
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 120
-        if ($resp.choices -and $resp.choices.Count -gt 0) {
-            $llmSummary = $resp.choices[0].message.content.Trim()
-            Write-Host "[release-notes] LLM summary generated ($($llmSummary.Length) chars)"
-        } else {
-            Write-Host "::warning::LLM response missing choices, falling back to categorized list"
-        }
+        Write-Host "[release-notes] Checking Ollama at $OllamaUrl"
+        $tagsResp = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -Method Get -TimeoutSec 10
+        $ollamaAvailable = $true
+        Write-Host "[release-notes] Ollama reachable, installed models: $($tagsResp.models.model -join ', ')"
     } catch {
-        Write-Host "::warning::LLM summarization failed: $($_.Exception.Message). Falling back to categorized list."
-        $llmSummary = $null
+        Write-Host "::warning::Ollama not available ($($_.Exception.Message))"
+    }
+
+    if ($ollamaAvailable) {
+        Write-Host "[release-notes] Generating summary via local Ollama model=$OllamaModel"
+        $ollamaBody = @{
+            model    = $OllamaModel
+            messages = @(
+                @{ role = 'system'; content = $systemPrompt },
+                @{ role = 'user'; content = $userPrompt }
+            )
+            stream   = $false
+            # Qwen3+ models enable thinking mode by default; the reasoning
+            # goes into message.thinking while message.content stays empty.
+            # Disable it so the final answer is returned in message.content.
+            think    = $false
+            options  = @{ temperature = 0.3; num_predict = 1200 }
+        } | ConvertTo-Json -Depth 6
+        try {
+            $resp = Invoke-RestMethod -Uri "$OllamaUrl/api/chat" -Method Post -ContentType 'application/json; charset=utf-8' -Body $ollamaBody -TimeoutSec 300
+            if ($resp.message -and $resp.message.content) {
+                $candidate = $resp.message.content.Trim()
+                if (Test-SummaryShape -Text $candidate) {
+                    $llmSummary = $candidate
+                    Write-Host "[release-notes] Ollama summary generated ($($llmSummary.Length) chars, shape check passed)"
+                } else {
+                    Write-Host "::warning::Ollama summary failed the shape check (model=$OllamaModel). Falling back."
+                }
+            } elseif ($resp.message -and $resp.message.thinking) {
+                # thinking present but no final content - treat as failure
+                Write-Host "::warning::Ollama returned thinking but empty content (model=$OllamaModel). Falling back."
+            } else {
+                Write-Host "::warning::Ollama returned empty response (model=$OllamaModel). Falling back."
+            }
+        } catch {
+            Write-Host "::warning::Ollama inference failed: $($_.Exception.Message)"
+        }
     }
 }
 
 if (-not $llmSummary) {
-    Write-Host "[release-notes] Using categorized commit list (Ollama and/or external LLM unavailable)"
+    Write-Host "[release-notes] Using categorized commit list (no LLM summary accepted)"
 }
 
 $sb = New-Object System.Text.StringBuilder
@@ -280,14 +407,9 @@ if ($llmSummary) {
 [void]$sb.AppendLine("---")
 [void]$sb.AppendLine("")
 
-[void]$sb.AppendLine("## Contributors ($($authors.Count))")
-[void]$sb.AppendLine("")
-$sorted = $authors.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending
-foreach ($a in $sorted) {
-    $commitWord = if ($a.Value.Count -gt 1) { 'commits' } else { 'commit' }
-    [void]$sb.AppendLine("- $($a.Value.Name) <$($a.Key)>: $($a.Value.Count) $commitWord")
+$outParent = Split-Path -Parent $OutputPath
+if ($outParent -and -not (Test-Path $outParent)) {
+    New-Item -ItemType Directory -Force -Path $outParent | Out-Null
 }
-[void]$sb.AppendLine("")
-
 [System.IO.File]::WriteAllText($OutputPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
 Write-Host "[release-notes] Release notes written to $OutputPath"
